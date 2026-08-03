@@ -1,0 +1,438 @@
+"""
+control_panel_stereo.py — EDI PIPE CAM control panel (hardware rev 3)
+=====================================================================
+Adds on top of the previous stereo panel:
+  * Telemetry frame (id 2) from the S3: step-count odometry in mm, IMU
+    pitch/roll, accel magnitude, drive/actuator/servo states
+  * Servo controls: HOOK / RELEASE (latching single-click, not hold)
+  * ZERO ODOM button ('Z')
+  * Lining-pull workflow for the deployment flow:
+       1. Stereo CV finds crack, Z distance shown as before
+       2. Extend actuator (deploy), press MARK PULL START
+       3. Enter required cover length (crack length + overlap margin)
+       4. Drive BACKWARD — the "pulled" readout counts up from the stepper
+          odometer and turns GREEN when the lining has covered the crack
+  * Slip hint: while driving, if the odometer advances but the IMU's accel
+    magnitude sits dead-still at 1.00 g, wheels may be slipping (odometry
+    overcounts). Shown as an amber warning.
+
+Why stepper odometry, not IMU distance: each step is a fixed travel
+increment (exact, drift-free); double-integrating IMU acceleration drifts
+quadratically and is unusable after ~1 s. The IMU is for roll (crack clock
+position) and slip detection.
+
+Frame protocol from S3 over USB CDC (921600):
+  0xAA 0x55 | id(1) | len(4 LE) | payload
+  id 0 = LEFT JPEG, 1 = RIGHT JPEG, 2 = telemetry JSON
+
+Dependencies:  pip install pyserial opencv-python pillow numpy
+               (+ pip install ultralytics   -- only if MODE = "yolo")
+"""
+
+import os, time, json, threading
+import tkinter as tk
+import numpy as np
+import cv2
+import serial
+import serial.tools.list_ports
+from PIL import Image, ImageTk
+
+# ============================ CONFIG ============================
+PORT          = "COM16"         # e.g. "COM5" or "/dev/ttyACM0". None = auto-detect
+MODE          = "classical"     # "none" | "classical" | "yolo"
+YOLO_WEIGHTS  = "best.pt"
+CALIB_FILE    = "stereo_calib.npz"
+CMD_REPEAT_MS = 150             # must be < firmware WATCHDOG_MS (400)
+DETECT_EVERY  = 0.25
+PAIR_MAX_AGE  = 0.30
+CALIB_DIR     = "calib_pairs"
+DATASET_DIR   = "dataset"
+AUTOCAP_SECS  = 1.0
+PULL_MARGIN_CM = 4.0            # extra overlap added to entered crack length
+
+# ============================ SERIAL ============================
+def find_port():
+    if PORT:
+        return PORT
+    for p in serial.tools.list_ports.comports():
+        d = (p.description or "").lower()
+        if "usb" in d or "cdc" in d or "esp32" in d or "serial" in d:
+            return p.device
+    raise RuntimeError("No serial port found — set PORT at the top of this file.")
+
+class FrameLink:
+    """Reader thread: parses AA55 frames. id 0/1 = JPEG, id 2 = telemetry JSON."""
+    def __init__(self, port):
+        self.ser = serial.Serial(port, 921600, timeout=0.05)
+        self.latest = {0: None, 1: None}       # camID -> (bgr, timestamp)
+        self.telem  = {}                        # last telemetry dict
+        self.lock = threading.Lock()
+        self.running = True
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def send(self, ch):
+        try:
+            self.ser.write(ch.encode())
+        except serial.SerialException:
+            pass
+
+    def _read_exact(self, n):
+        buf = b""
+        while len(buf) < n and self.running:
+            chunk = self.ser.read(n - len(buf))
+            if chunk:
+                buf += chunk
+        return buf
+
+    def _reader(self):
+        state = 0
+        while self.running:
+            b = self.ser.read(1)
+            if not b:
+                continue
+            b = b[0]
+            if state == 0:
+                state = 1 if b == 0xAA else 0
+            elif state == 1:
+                if b == 0x55:
+                    hdr = self._read_exact(5)
+                    fid = hdr[0]
+                    length = int.from_bytes(hdr[1:5], "little")
+                    if 0 < length < 300_000:
+                        payload = self._read_exact(length)
+                        if fid in (0, 1):
+                            img = cv2.imdecode(np.frombuffer(payload, np.uint8),
+                                               cv2.IMREAD_COLOR)
+                            if img is not None:
+                                with self.lock:
+                                    self.latest[fid] = (img, time.time())
+                        elif fid == 2:
+                            try:
+                                t = json.loads(payload.decode(errors="ignore"))
+                                with self.lock:
+                                    self.telem = t
+                            except json.JSONDecodeError:
+                                pass
+                state = 0
+
+    def get_pair(self):
+        with self.lock:
+            l, r = self.latest[0], self.latest[1]
+        if l is None or r is None:
+            return (l[0] if l else None), (r[0] if r else None), False
+        return l[0], r[0], abs(l[1] - r[1]) <= PAIR_MAX_AGE
+
+    def get_telem(self):
+        with self.lock:
+            return dict(self.telem)
+
+# ============================ CALIBRATION DATA ============================
+class StereoCalib:
+    def __init__(self, path):
+        self.ok = False
+        if os.path.exists(path):
+            d = np.load(path)
+            self.map1x, self.map1y = d["map1x"], d["map1y"]
+            self.map2x, self.map2y = d["map2x"], d["map2y"]
+            self.fx       = float(d["fx"])
+            self.baseline = float(d["baseline"])
+            self.ok = True
+
+    def rectify(self, left, right):
+        if not self.ok:
+            return left, right
+        l = cv2.remap(left,  self.map1x, self.map1y, cv2.INTER_LINEAR)
+        r = cv2.remap(right, self.map2x, self.map2y, cv2.INTER_LINEAR)
+        return l, r
+
+    def depth_from_disparity(self, d_px):
+        if not self.ok or d_px <= 0.5:
+            return None
+        return self.fx * self.baseline / d_px
+
+# ============================ DETECTORS ============================
+def detect_classical(bgr):
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                               cv2.THRESH_BINARY_INV, 31, 8)
+    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE,
+                          cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
+    boxes = []
+    cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area < 60:
+            continue
+        x, y, w, h = cv2.boundingRect(c)
+        elong = max(w, h) / max(1, min(w, h))
+        fill  = area / max(1, w * h)
+        if elong > 2.5 and fill < 0.5:
+            boxes.append((x, y, w, h))
+    return boxes
+
+class YoloDetector:
+    def __init__(self, weights):
+        from ultralytics import YOLO
+        self.model = YOLO(weights)
+
+    def __call__(self, bgr):
+        res = self.model.predict(bgr, imgsz=320, conf=0.4, verbose=False)[0]
+        return [(int(b[0]), int(b[1]), int(b[2] - b[0]), int(b[3] - b[1]))
+                for b in res.boxes.xyxy.cpu().numpy()]
+
+# ============================ STEREO MATCH ============================
+def match_disparity(left_rect, right_rect, box):
+    x, y, w, h = box
+    H, W = left_rect.shape[:2]
+    x, y = max(0, x), max(0, y)
+    w, h = min(w, W - x), min(h, H - y)
+    if w < 8 or h < 8:
+        return None
+    tmpl = cv2.cvtColor(left_rect[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
+    band_y0, band_y1 = max(0, y - 4), min(H, y + h + 4)
+    strip = cv2.cvtColor(right_rect[band_y0:band_y1, :], cv2.COLOR_BGR2GRAY)
+    if strip.shape[0] < tmpl.shape[0] or strip.shape[1] < tmpl.shape[1]:
+        return None
+    res = cv2.matchTemplate(strip, tmpl, cv2.TM_CCOEFF_NORMED)
+    _, maxv, _, maxloc = cv2.minMaxLoc(res)
+    if maxv < 0.5:
+        return None
+    d = float(x - maxloc[0])
+    return d if d > 0.5 else None
+
+# ============================ CV WORKER ============================
+class Detector(threading.Thread):
+    def __init__(self, link, calib):
+        super().__init__(daemon=True)
+        self.link, self.calib = link, calib
+        self.result = None
+        self.lock = threading.Lock()
+        self.yolo = YoloDetector(YOLO_WEIGHTS) if MODE == "yolo" else None
+        self.start()
+
+    def run(self):
+        while True:
+            time.sleep(DETECT_EVERY)
+            if MODE == "none":
+                continue
+            l, r, synced = self.link.get_pair()
+            if l is None or r is None:
+                continue
+            lr, rr = self.calib.rectify(l.copy(), r.copy())
+            boxes = self.yolo(lr) if self.yolo else detect_classical(lr)
+            info = f"{len(boxes)} crack(s)"
+            for box in boxes:
+                x, y, w, h = box
+                cv2.rectangle(lr, (x, y), (x + w, y + h), (0, 0, 255), 2)
+                z_txt = ""
+                if synced and self.calib.ok:
+                    d = match_disparity(lr, rr, box)
+                    z = self.calib.depth_from_disparity(d) if d else None
+                    if z is not None:
+                        z_txt = f"{z*100:.1f} cm"
+                        cv2.rectangle(rr, (int(x - d), y),
+                                      (int(x - d + w), y + h), (0, 255, 255), 1)
+                elif not self.calib.ok:
+                    z_txt = "no calib"
+                if z_txt:
+                    cv2.putText(lr, z_txt, (x, max(12, y - 5)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            with self.lock:
+                self.result = (lr, rr, info)
+
+    def get(self):
+        with self.lock:
+            return self.result
+
+# ============================ GUI ============================
+class App:
+    def __init__(self, root, link, calib):
+        self.root, self.link, self.calib = root, link, calib
+        self.detector = Detector(link, calib)
+        root.title("EDI PIPE CAM — Stereo Control Panel (rev 3)")
+
+        vid = tk.Frame(root); vid.pack()
+        self.lblL = tk.Label(vid, text="LEFT (cam 0)");  self.lblL.grid(row=0, column=0, padx=4)
+        self.lblR = tk.Label(vid, text="RIGHT (cam 1)"); self.lblR.grid(row=0, column=1, padx=4)
+
+        self.status = tk.Label(root, text="mode: " + MODE +
+                               ("  |  calib: OK" if calib.ok else "  |  calib: MISSING"),
+                               fg="green" if calib.ok else "red")
+        self.status.pack()
+
+        # ---- telemetry readout ----
+        tf = tk.LabelFrame(root, text="Telemetry (stepper odometry + IMU)")
+        tf.pack(fill="x", padx=6, pady=4)
+        self.lbl_odo  = tk.Label(tf, text="dist: --- mm", font=("Consolas", 12, "bold"))
+        self.lbl_odo.grid(row=0, column=0, padx=8)
+        self.lbl_imu  = tk.Label(tf, text="pitch: ---  roll: ---")
+        self.lbl_imu.grid(row=0, column=1, padx=8)
+        self.lbl_state = tk.Label(tf, text="drv:-- act:-- hook:--")
+        self.lbl_state.grid(row=0, column=2, padx=8)
+        self.lbl_slip = tk.Label(tf, text="", fg="#b8860b")
+        self.lbl_slip.grid(row=0, column=3, padx=8)
+        tk.Button(tf, text="ZERO ODOM", command=lambda: self.link.send('Z')
+                  ).grid(row=0, column=4, padx=8)
+
+        # ---- drive + actuator (press & hold) ----
+        drive = tk.Frame(root); drive.pack(pady=4)
+        self._hold_btn(drive, "▲ FORWARD",  'F', 'S', 0, 1)
+        self._hold_btn(drive, "▼ BACKWARD", 'B', 'S', 2, 1)
+        self._hold_btn(drive, "EXTEND",  'E', 'X', 1, 0)
+        self._hold_btn(drive, "RETRACT", 'R', 'X', 1, 2)
+
+
+# ---- servo (latching, single click) ----
+        sf = tk.Frame(root); sf.pack(pady=2)
+        tk.Button(sf, text="⚓ HOOK",    width=12, command=lambda: self.link.send('H')
+                  ).grid(row=0, column=0, padx=4)
+        tk.Button(sf, text="✂ RELEASE", width=12, command=lambda: self.link.send('U')
+                  ).grid(row=0, column=1, padx=4)
+        tk.Button(sf, text="🔧 ASSEMBLY (90°)", width=16, command=lambda: self.link.send('A')
+                  ).grid(row=0, column=2, padx=4)
+
+        # ---- lining pull workflow ----
+        pf = tk.LabelFrame(root, text="Lining pull (deploy → mark → back until green)")
+        pf.pack(fill="x", padx=6, pady=4)
+        tk.Button(pf, text="MARK PULL START", command=self.mark_pull
+                  ).grid(row=0, column=0, padx=6)
+        tk.Label(pf, text="crack length (cm):").grid(row=0, column=1)
+        self.ent_len = tk.Entry(pf, width=6); self.ent_len.insert(0, "10")
+        self.ent_len.grid(row=0, column=2, padx=2)
+        tk.Label(pf, text=f"+{PULL_MARGIN_CM:.0f} margin").grid(row=0, column=3)
+        self.lbl_pull = tk.Label(pf, text="pulled: --- cm", font=("Consolas", 12, "bold"))
+        self.lbl_pull.grid(row=0, column=4, padx=10)
+        self.pull_start_mm = None
+
+        # ---- capture controls ----
+        cap = tk.Frame(root); cap.pack(pady=4)
+        tk.Button(cap, text="CALIB PAIR", command=self.save_calib_pair).grid(row=0, column=0, padx=4)
+        tk.Button(cap, text="SAVE (dataset)", command=self.save_dataset).grid(row=0, column=1, padx=4)
+        self.autocap = False
+        self.btn_auto = tk.Button(cap, text="AUTO-CAP: OFF", command=self.toggle_autocap)
+        self.btn_auto.grid(row=0, column=2, padx=4)
+
+        self._held_cmd = None
+        os.makedirs(CALIB_DIR, exist_ok=True)
+        os.makedirs(DATASET_DIR, exist_ok=True)
+        self._last_autocap = 0
+        self._tick_video()
+        self._tick_cmd()
+
+    # ---- press-and-hold plumbing ----
+    def _hold_btn(self, parent, text, cmd, stop_cmd, r, c):
+        b = tk.Button(parent, text=text, width=12)
+        b.grid(row=r, column=c, padx=4, pady=2)
+        b.bind("<ButtonPress-1>",   lambda e: self._start_hold(cmd))
+        b.bind("<ButtonRelease-1>", lambda e: self._stop_hold(stop_cmd))
+
+    def _start_hold(self, cmd):
+        self._held_cmd = cmd
+        self.link.send(cmd)
+
+    def _stop_hold(self, stop_cmd):
+        self._held_cmd = None
+        self.link.send(stop_cmd)
+
+    def _tick_cmd(self):
+        if self._held_cmd:
+            self.link.send(self._held_cmd)
+        self.root.after(CMD_REPEAT_MS, self._tick_cmd)
+
+    # ---- lining pull ----
+    def mark_pull(self):
+        t = self.link.get_telem()
+        self.pull_start_mm = t.get("mm")
+        self.lbl_pull.config(text="pulled: 0.0 cm", fg="black")
+
+    # ---- video + telemetry loop ----
+    def _tick_video(self):
+        det = self.detector.get() if MODE != "none" else None
+        if det:
+            l, r, info = det
+            self.status.config(text=f"mode: {MODE}  |  {info}" +
+                               ("" if self.calib.ok else "  |  calib: MISSING"))
+        else:
+            l, r, _ = self.link.get_pair()
+        self._show(self.lblL, l)
+        self._show(self.lblR, r)
+
+        t = self.link.get_telem()
+        if t:
+            self.lbl_odo.config(text=f"dist: {t.get('mm', 0):.1f} mm")
+            self.lbl_imu.config(
+                text=f"pitch: {t.get('pitch', 0):+.1f}°  roll: {t.get('roll', 0):+.1f}°"
+                     + ("" if t.get("imu") else "  (IMU MISSING)"))
+            drv  = {1: "FWD", -1: "BACK", 0: "stop"}.get(t.get("drv"), "?")
+            act  = {1: "EXT", -1: "RET",  0: "idle"}.get(t.get("act"), "?")
+            hook = "HOOKED" if t.get("hook") else "RELEASED"
+            self.lbl_state.config(text=f"drv:{drv}  act:{act}  {hook}")
+
+            # slip hint: driving, but accel magnitude pinned at rest value
+            moving = t.get("drv", 0) != 0
+            amag = t.get("amag", 1.0)
+            self.lbl_slip.config(
+                text="⚠ possible wheel slip" if moving and abs(amag - 1.0) < 0.01 else "")
+
+            # pull progress
+            if self.pull_start_mm is not None and "mm" in t:
+                pulled_cm = abs(t["mm"] - self.pull_start_mm) / 10.0
+                try:
+                    target = float(self.ent_len.get()) + PULL_MARGIN_CM
+                except ValueError:
+                    target = PULL_MARGIN_CM
+                done = pulled_cm >= target
+                self.lbl_pull.config(
+                    text=f"pulled: {pulled_cm:.1f} / {target:.1f} cm"
+                         + ("  ✔ COVERED" if done else ""),
+                    fg="green" if done else "black")
+
+        if self.autocap and time.time() - self._last_autocap > AUTOCAP_SECS:
+            self.save_dataset()
+            self._last_autocap = time.time()
+
+        self.root.after(50, self._tick_video)
+
+    def _show(self, lbl, bgr):
+        if bgr is None:
+            return
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        im = ImageTk.PhotoImage(Image.fromarray(rgb))
+        lbl.configure(image=im)
+        lbl.image = im
+
+    # ---- capture ----
+    def _save_pair(self, folder, tag):
+        l, r, synced = self.link.get_pair()
+        if l is None or r is None:
+            print("Pair not ready"); return
+        if not synced:
+            print("WARNING: frames not synchronized — pair may be skewed")
+        ts = int(time.time() * 1000)
+        cv2.imwrite(os.path.join(folder, f"{tag}_{ts}_L.png"), l)
+        cv2.imwrite(os.path.join(folder, f"{tag}_{ts}_R.png"), r)
+        print(f"saved pair {ts} -> {folder}")
+
+    def save_calib_pair(self):
+        self._save_pair(CALIB_DIR, "calib")
+
+    def save_dataset(self):
+        self._save_pair(DATASET_DIR, "data")
+
+    def toggle_autocap(self):
+        self.autocap = not self.autocap
+        self.btn_auto.config(text=f"AUTO-CAP: {'ON' if self.autocap else 'OFF'}")
+
+# ============================ MAIN ============================
+if __name__ == "__main__":
+    port = find_port()
+    print("Using port:", port)
+    link  = FrameLink(port)
+    calib = StereoCalib(CALIB_FILE)
+    if not calib.ok:
+        print("No stereo calibration found — distances disabled. "
+              "Run stereo_calibrate.py after capturing CALIB PAIRs.")
+    root = tk.Tk()
+    App(root, link, calib)
+    root.mainloop()
