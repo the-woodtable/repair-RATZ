@@ -3,6 +3,7 @@
 #include "Stepper.h"
 #include "Actuator.h"
 #include "StereoCameras.h"
+#include "IMU.h"
 
 //PINS
 int PIN_SERVO = 11;
@@ -18,13 +19,15 @@ int PIN_ACT_STBY = 10;   // TB6612 STBY — set to your actual pin
 int CAML_RX = 18;   // left cam U0T  -> S3
 int CAMR_RX = 16;   // right cam U0T -> S3
  
+int PIN_SDA = 8;   
+int PIN_SCL = 9;  
 
 //OBJECTS FROM CLASSES
 HookServo hookServo;
 Stepper stepper;
 Actuator actuator;
 StereoCameras cameras; 
- 
+IMU imu;
 
 
 //STEPPER VARIABLES
@@ -61,8 +64,11 @@ void setup() {
   }
     if (!cameras.begin(CAML_RX, -1, CAMR_RX, -1)) { 
     Serial.println("ERROR: camera buffers failed to attach!");
-    setupSuccessful = false; }
+    setupSuccessful = false; 
 
+  } if (!imu.begin(PIN_SDA, PIN_SCL)) {
+  Serial.println("ERROR: IMU not found!");
+  setupSuccessful = false;}
   
   
 }
@@ -70,14 +76,18 @@ void setup() {
 void sendTelemetry() {
   char js[160];
   snprintf(js, sizeof(js),
-    "{\"servo_angle\":%d,\"steps\":%ld,\"drv\":%d,\"act\":%d}",
+    "{\"servo_angle\":%d,\"steps\":%ld,\"drv\":%d,\"act\":%d,"
+    "\"imu_pos\":%.4f,\"imu_vel\":%.4f,\"imu_bias\":%.5f,\"slip\":%d}",
     hookServo.getCurrentAngle(), (long)stepper.getStepCount(),
-    stepper.getDrive(), actuator.getState());
+    stepper.getDrive(), actuator.getState(),
+    imu.getPosition(), imu.getVelocity(), imu.getBias(), imu.isSlipping());
   cameras.sendTelemetryFrame(js);
 }
 
 void loop() {
   cameras.update();
+  imu.setDriveActive(stepper.getDrive() != 0);
+  imu.update();
 
   while (Serial.available()) {
     char c = Serial.read();
@@ -97,12 +107,14 @@ void loop() {
       case 'F': stepper.setDrive(+1); break;
       case 'B': stepper.setDrive(-1); break;
       case 'S': stepper.setDrive(0);  break;
-      case 'Z': stepper.zero(); break;
       
       // -- actuator --
       case 'D': actuator.extend(ACT_SPEED);  break;  // deploy
       case 'R': actuator.retract(ACT_SPEED); break;  // retract
       case 'X': actuator.stop();             break;
+
+      // -- IMU --
+      case 'Z': stepper.zero(); imu.zero(); break;
  
 
       default:
