@@ -19,8 +19,8 @@ int PIN_ACT_STBY = 10;   // TB6612 STBY — set to your actual pin
 int CAML_RX = 18;   // left cam U0T  -> S3
 int CAMR_RX = 16;   // right cam U0T -> S3
  
-int PIN_SDA = 8;   
-int PIN_SCL = 9;  
+int PIN_SDA = 13;
+int PIN_SCL = 14;
 
 //OBJECTS FROM CLASSES
 HookServo hookServo;

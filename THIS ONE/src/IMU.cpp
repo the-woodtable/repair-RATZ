@@ -31,22 +31,29 @@ void IMU::imuWrite(uint8_t reg, uint8_t val) {
   Wire.endTransmission();
 }
 
-void IMU::readAccelRaw(int16_t& ax, int16_t& ay, int16_t& az) {
+bool IMU::readAccelRaw(int16_t& ax, int16_t& ay, int16_t& az) {
   Wire.beginTransmission(imuAddr_);
   Wire.write(REG_ACCEL_XOUT_H);
   Wire.endTransmission(false);
   Wire.requestFrom((int)imuAddr_, 6);
 
+  if (Wire.available() < 6) {
+    return false;   // bus glitch or sensor didn't respond in time — bail out
+  }
+
   ax = (Wire.read() << 8) | Wire.read();
   ay = (Wire.read() << 8) | Wire.read();
   az = (Wire.read() << 8) | Wire.read();
+  return true;
 }
 
 void IMU::update() {
   if (!imuAddr_) return;
 
   int16_t axRaw, ayRaw, azRaw;
-  readAccelRaw(axRaw, ayRaw, azRaw);
+  if (!readAccelRaw(axRaw, ayRaw, azRaw)) {
+    return;   // skip this cycle entirely — don't feed garbage into the Kalman filter
+  }
 
   float ax = axRaw / 16384.0f;
   float ay = ayRaw / 16384.0f;

@@ -25,7 +25,7 @@ public:
 
 private:
   void imuWrite(uint8_t reg, uint8_t val);
-  void readAccelRaw(int16_t& ax, int16_t& ay, int16_t& az);
+  bool readAccelRaw(int16_t& ax, int16_t& ay, int16_t& az);   // now returns success/failure
   void kalmanPredict(float uAccel, float dt);
   void kalmanCorrect(float zPos, float noiseStd);
   void matMul3x3(const float A[3][3], const float B[3][3], float R[3][3]);
