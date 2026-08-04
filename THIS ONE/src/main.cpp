@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include "HookServo.h"
 #include "Stepper.h"
+#include "Actuator.h"
 
 //PINS
 int PIN_SERVO = 11;
@@ -8,16 +9,26 @@ int PIN_STEP =  4;
 int PIN_DIR = 5;
 int PIN_EN =  6;
 
+int PIN_ACT_AIN1 = 7;
+int PIN_ACT_AIN2 = 8;
+int PIN_ACT_PWM  = 9;    // TB6612 PWMA — set to your actual pin
+int PIN_ACT_STBY = 10;   // TB6612 STBY — set to your actual pin
+ 
 
 //OBJECTS FROM CLASSES
 HookServo hookServo;
 Stepper stepper;
+Actuator actuator;
+ 
 
 
-//STEPPER VARIABLESf
+//STEPPER VARIABLES
 int STEP_HZ = 800;
 
-
+ 
+//ACTUATOR VARIABLES
+int ACT_SPEED = 200;   // 0-255, default speed for jog commands
+ 
 
 //OTHER VARIABLES
 bool setupSuccessful = true;
@@ -39,6 +50,11 @@ void setup() {
     Serial.println("ERROR: stepper timer failed to start!");
     setupSuccessful = false;
   }
+    if (!actuator.begin(PIN_ACT_AIN1, PIN_ACT_AIN2, PIN_ACT_PWM, PIN_ACT_STBY)) {
+    Serial.println("ERROR: actuator failed to attach!");
+    setupSuccessful = false;
+  }
+  
   
 }
 
@@ -49,6 +65,8 @@ void sendTelemetry() {
   Serial.print(stepper.getStepCount());
   Serial.print(",\"stepper direction\":");
   Serial.print(stepper.getDrive());
+   Serial.print(",\"actuator state\":");
+  Serial.print(actuator.getState());
   Serial.println("}");
 }
 
@@ -72,6 +90,12 @@ void loop() {
       case 'B': stepper.setDrive(-1); break;
       case 'S': stepper.setDrive(0);  break;
       case 'Z': stepper.zero(); break;
+      
+      // -- actuator --
+      case 'D': actuator.extend(ACT_SPEED);  break;  // deploy
+      case 'R': actuator.retract(ACT_SPEED); break;  // retract
+      case 'X': actuator.stop();             break;
+ 
 
       default:
         break;   // ignore unrecognized characters
