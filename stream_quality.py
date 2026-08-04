@@ -15,6 +15,10 @@ Works on either source:
 Use it to tune camera firmware: run once, change ONE setting (jpeg_quality,
 frame_size, baud), reflash, run again, compare the two reports.
 
+Only pyserial is REQUIRED (pip install pyserial). If opencv-python and numpy
+are also installed you additionally get image metrics and sample frames;
+without them the transport report still works.
+
 What good looks like (QVGA via S3 at 460800):
   fps 5-10 | corrupt < 5% | sharpness > 100 on a textured scene
 Sharpness is scene-dependent: always compare on the SAME scene, ideally a
@@ -22,14 +26,22 @@ printed page or checkerboard at a fixed distance.
 """
 
 import os
+import statistics
 import struct
 import sys
 import time
 
-import cv2
-import numpy as np
 import serial
 from serial.tools import list_ports
+
+# OpenCV/numpy are OPTIONAL. Without them you still get the full transport
+# report; only the image metrics and sample frames need decoding.
+try:
+    import cv2
+    import numpy as np
+    HAVE_CV = True
+except ImportError:
+    HAVE_CV = False
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else None
 BAUD = int(sys.argv[2]) if len(sys.argv) > 2 else 921600
@@ -152,7 +164,7 @@ def main():
     print(f"fps (good)     : {len(frames)/SECONDS:.1f}")
     sizes = [len(j) for _, j in frames]
     if sizes:
-        print(f"frame size     : avg {np.mean(sizes)/1000:.1f} KB   "
+        print(f"frame size     : avg {statistics.mean(sizes)/1000:.1f} KB   "
               f"min {min(sizes)/1000:.1f}   max {max(sizes)/1000:.1f}")
         by_cam = {}
         for cam, _ in frames:
@@ -161,6 +173,21 @@ def main():
 
     print()
     print("================ IMAGE ====================")
+    if not HAVE_CV:
+        # Still save the raw JPEGs — they can be opened in any image viewer,
+        # and analysed later on a machine that does have OpenCV.
+        os.makedirs(SAMPLE_DIR, exist_ok=True)
+        ts = time.strftime("%H%M%S")
+        step = max(1, len(frames) // 5)
+        for k, (_, jpg) in enumerate(frames[::step][:5]):
+            with open(os.path.join(SAMPLE_DIR, f"sample_{ts}_{k}.jpg"), "wb") as f:
+                f.write(jpg)
+        print("opencv-python / numpy not installed — image metrics skipped.")
+        print(f"saved {min(5, len(frames))} raw frames -> {SAMPLE_DIR}")
+        print("(open them in any image viewer, or install with:")
+        print("   pip install opencv-python numpy   )")
+        return
+
     metrics = [m for m in (image_metrics(j) for _, j in frames) if m]
     if not metrics:
         print("No frame decoded — all corrupt.")
@@ -171,13 +198,14 @@ def main():
     ct = [m["contrast"] for m in metrics]
     fb = [m["flat_bottom_pct"] for m in metrics]
     h, w = metrics[0]["shape"][:2]
+    med_br = statistics.median(br)
     print(f"resolution     : {w}x{h}")
     print(f"decode failures: {decode_fail}")
-    print(f"sharpness      : median {np.median(sh):.0f}   "
+    print(f"sharpness      : median {statistics.median(sh):.0f}   "
           f"(focus/detail — compare on the SAME scene)")
-    print(f"brightness     : median {np.median(br):.0f} / 255   "
-          f"({'DARK — add light' if np.median(br) < 60 else 'ok' if np.median(br) < 200 else 'BRIGHT — may clip'})")
-    print(f"contrast       : median {np.median(ct):.0f}")
+    print(f"brightness     : median {med_br:.0f} / 255   "
+          f"({'DARK — add light' if med_br < 60 else 'ok' if med_br < 200 else 'BRIGHT — may clip'})")
+    print(f"contrast       : median {statistics.median(ct):.0f}")
     bad_bottom = sum(1 for v in fb if v > 5)
     print(f"gray-bottom    : {bad_bottom}/{len(metrics)} frames have >5% "
           f"flat bottom rows (truncated captures)")
