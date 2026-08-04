@@ -1,5 +1,8 @@
 #include "Actuator.h"
 
+static const int ACT_PWM_CH = 0;   // LEDC channel used for the actuator
+
+
 bool Actuator::begin(int ain1, int ain2, int pwm, int stby){
     ain1_ = ain1;
     ain2_ = ain2;
@@ -32,7 +35,7 @@ void Actuator::extend(int speed) {
 
   digitalWrite(ain1_, HIGH);
   digitalWrite(ain2_, LOW);
-  ledcWrite(pwm_, speed);
+  ledcWrite(ACT_PWM_CH, speed);
 
   state_ = 1;
   lastCommandMs_ = millis();
@@ -44,7 +47,7 @@ void Actuator::retract(int speed){
 
   digitalWrite(ain1_, LOW);
   digitalWrite(ain2_, HIGH);
-  ledcWrite(pwm_, speed);
+  ledcWrite(ACT_PWM_CH, speed);
 
   state_ = -1;
   lastCommandMs_ = millis();
