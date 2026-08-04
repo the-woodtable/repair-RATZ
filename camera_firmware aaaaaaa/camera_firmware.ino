@@ -1,18 +1,18 @@
 /*
   EDI PIPE CAM — ESP32-CAM firmware (flash to BOTH cameras, identical)
   -------------------------------------------------------------------
-  Streams 0xAA55-framed JPEG over UART0 at 921600 baud.
+  Streams 0xAA55-framed JPEG over UART0 (see Serial.begin below).
   Frame format OUT of the camera:  0xAA 0x55 | uint32 LE length | JPEG
 
   The camera does NOT identify itself as left or right — identity is
-  decided by which S3 UART it is wired into (see s3_cam_forwarder.h).
+  decided by which S3 UART it is wired into (see StereoCameras.h).
   So both cameras run this exact sketch with zero configuration.
 
-  Wiring per camera (4 wires):
+  Wiring per camera (3 wires):
     5V  -> shared 5V rail (each cam can spike ~500 mA, budget for it)
     GND -> shared GND
     U0T (GPIO1, TX) -> the S3 RX pin assigned to this camera  [video out]
-    U0R (GPIO3, RX) <- the S3 TX pin assigned to this camera  [commands in]
+    (U0R is not used — the S3 never sends anything to the camera)
 
   IMPORTANT: U0T/U0R are also the flashing pins. DISCONNECT both from the
   S3 before flashing this sketch with a USB-serial adapter, then reconnect.
@@ -91,44 +91,7 @@ void setup() {
   }
 }
 
-// ---------------- live control commands (from the S3 TX line) ----------------
-// Single ASCII chars, applied instantly, no reflashing needed:
-//   q / Q  jpeg quality worse / better   (10 = best, 40 = worst; smaller
-//                                         frames = higher fps)
-//   b / B  brightness down / up          (-2 .. +2)
-//   c / C  contrast down / up            (-2 .. +2)
-//   1      QQVGA 160x120     2  QVGA 320x240 (default, calibrated)
-//   3      VGA   640x480     4  SVGA 800x600
-//   f / F  flash LED off / on            (GPIO 4, useful inside a pipe)
-//
-// NOTE: changing resolution INVALIDATES the stereo calibration — the panel
-// will report wrong distances until you recalibrate at that resolution.
-// Use 3/4 only for capturing detailed stills for the crack dataset.
-void handleCommands() {
-  while (Serial.available()) {
-    char c = Serial.read();
-    sensor_t *s = esp_camera_sensor_get();
-    if (!s) return;
-    switch (c) {
-      case 'q': s->set_quality(s, min(40, s->status.quality + 2)); break;
-      case 'Q': s->set_quality(s, max(10, s->status.quality - 2)); break;
-      case 'b': s->set_brightness(s, max(-2, s->status.brightness - 1)); break;
-      case 'B': s->set_brightness(s, min(2, s->status.brightness + 1)); break;
-      case 'c': s->set_contrast(s, max(-2, s->status.contrast - 1)); break;
-      case 'C': s->set_contrast(s, min(2, s->status.contrast + 1)); break;
-      case '1': s->set_framesize(s, FRAMESIZE_QQVGA); break;
-      case '2': s->set_framesize(s, FRAMESIZE_QVGA);  break;
-      case '3': s->set_framesize(s, FRAMESIZE_VGA);   break;
-      case '4': s->set_framesize(s, FRAMESIZE_SVGA);  break;
-      case 'f': pinMode(4, OUTPUT); digitalWrite(4, LOW);  break;
-      case 'F': pinMode(4, OUTPUT); digitalWrite(4, HIGH); break;
-    }
-  }
-}
-
 void loop() {
-  handleCommands();
-
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) { delay(10); return; }
 
