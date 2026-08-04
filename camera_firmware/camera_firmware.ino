@@ -67,7 +67,7 @@ void setup() {
                                     // (mostly-grey images) and low fps.
   config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size   = FRAMESIZE_QVGA;   // 320x240 — keep! stereo calib assumes this
-  config.jpeg_quality = 15;               // ~8-15 KB/frame -> ~6-10 fps at 921600 baud
+  config.jpeg_quality = 20;               // ~8-15 KB/frame -> ~6-10 fps at 921600 baud
   config.fb_count     = 2;
   config.grab_mode    = CAMERA_GRAB_LATEST;
 

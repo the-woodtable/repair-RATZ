@@ -2,6 +2,7 @@
 #include "StereoCameras.h"
 
 static const uint32_t CAM_MAX_FRAME = 60000;
+static const uint32_t CAM_MIN_FRAME = 512;   // smaller than any real frame
 
 // ---------------- Channel ----------------
 
@@ -38,10 +39,18 @@ void StereoCameras::Channel::pump() {
           len = (uint32_t)hdr[0] | ((uint32_t)hdr[1] << 8) |
                 ((uint32_t)hdr[2] << 16) | ((uint32_t)hdr[3] << 24);
           got = 0;
-          state = (len > 0 && len < CAM_MAX_FRAME && buf) ? 3 : 0;
+          // Sanity range as well as the buffer limit: a real QVGA JPEG is
+          // never a few hundred bytes. A corrupted length that still looks
+          // plausible would otherwise swallow the frames that follow.
+          state = (len >= CAM_MIN_FRAME && len < CAM_MAX_FRAME && buf) ? 3 : 0;
         }
         break;
       case 3:  // collecting JPEG body
+        // Every JPEG starts FF D8. Checking the first two bytes turns a
+        // corrupted header into a 2-byte loss instead of eating the next
+        // ~60 KB (which showed up as the stream freezing after one glitch).
+        if (got == 0 && b != 0xFF) { state = 0; break; }
+        if (got == 1 && b != 0xD8) { state = 0; break; }
         buf[got++] = b;
         if (got == len) {
           emit();
