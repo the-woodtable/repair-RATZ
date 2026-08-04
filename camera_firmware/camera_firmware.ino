@@ -45,7 +45,7 @@
 static const uint8_t MAGIC[2] = {0xAA, 0x55};
 
 void setup() {
-  Serial.begin(460800);
+  Serial.begin(921600);
 
   camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -62,7 +62,9 @@ void setup() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn  = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
+  config.xclk_freq_hz = 20000000;   // OV5640 needs this. Lowering it to 10 MHz
+                                    // starves the sensor -> truncated frames
+                                    // (mostly-grey images) and low fps.
   config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size   = FRAMESIZE_QVGA;   // 320x240 — keep! stereo calib assumes this
   config.jpeg_quality = 15;               // ~8-15 KB/frame -> ~6-10 fps at 921600 baud
@@ -76,43 +78,7 @@ void setup() {
   }
 }
 
-// ---------------- live control commands (from the S3 TX line) ----------------
-// Single ASCII chars, applied instantly, no reflashing needed:
-//   q / Q  jpeg quality worse / better   (10 = best, 40 = worst; smaller
-//                                         frames = higher fps)
-//   b / B  brightness down / up          (-2 .. +2)
-//   c / C  contrast down / up            (-2 .. +2)
-//   1      QQVGA 160x120     2  QVGA 320x240 (default, calibrated)
-//   3      VGA   640x480     4  SVGA 800x600
-//   f / F  flash LED off / on            (GPIO 4, useful inside a pipe)
-//
-// NOTE: changing resolution INVALIDATES the stereo calibration — the panel
-// will report wrong distances until you recalibrate at that resolution.
-// Use 3/4 only for capturing detailed stills for the crack dataset.
-void handleCommands() {
-  while (Serial.available()) {
-    char c = Serial.read();
-    sensor_t *s = esp_camera_sensor_get();
-    if (!s) return;
-    switch (c) {
-      case 'q': s->set_quality(s, min(40, s->status.quality + 2)); break;
-      case 'Q': s->set_quality(s, max(10, s->status.quality - 2)); break;
-      case 'b': s->set_brightness(s, max(-2, s->status.brightness - 1)); break;
-      case 'B': s->set_brightness(s, min(2, s->status.brightness + 1)); break;
-      case 'c': s->set_contrast(s, max(-2, s->status.contrast - 1)); break;
-      case 'C': s->set_contrast(s, min(2, s->status.contrast + 1)); break;
-      case '1': s->set_framesize(s, FRAMESIZE_QQVGA); break;
-      case '2': s->set_framesize(s, FRAMESIZE_QVGA);  break;
-      case '3': s->set_framesize(s, FRAMESIZE_VGA);   break;
-      case '4': s->set_framesize(s, FRAMESIZE_SVGA);  break;
-      case 'f': pinMode(4, OUTPUT); digitalWrite(4, LOW);  break;
-      case 'F': pinMode(4, OUTPUT); digitalWrite(4, HIGH); break;
-    }
-  }
-}
-
 void loop() {
-  handleCommands();
 
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) { delay(10); return; }

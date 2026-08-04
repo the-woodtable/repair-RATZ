@@ -10,10 +10,11 @@ bool Actuator::begin(int ain1, int ain2, int pwm, int stby){
     pinMode(ain2_, OUTPUT);
     pinMode(stby_, OUTPUT);
 
-    if (!ledcAttach(pwm_, 20000, 8)) {   // 20kHz, 8-bit duty (0-255)
-        return false;                     // pin invalid or no free channel
-    }
- 
+    ledcSetup(0, 20000, 8);        // pick a channel number unused elsewhere in the project
+    ledcAttachPin(pwm_, 0);
+
+    digitalWrite(ain1_, LOW);   
+    digitalWrite(ain1_, LOW);   
     digitalWrite(stby_, HIGH);            // wake the TB6612 out of standby
  
     stop();
@@ -34,6 +35,7 @@ void Actuator::extend(int speed) {
   ledcWrite(pwm_, speed);
 
   state_ = 1;
+  lastCommandMs_ = millis();
 }
 
 void Actuator::retract(int speed){
@@ -45,12 +47,19 @@ void Actuator::retract(int speed){
   ledcWrite(pwm_, speed);
 
   state_ = -1;
+  lastCommandMs_ = millis();
 }
 
 void Actuator::stop() {
   digitalWrite(ain1_, LOW);
   digitalWrite(ain2_, LOW);
   state_ = 0;
+}
+
+void Actuator::update() {
+  if (state_ != 0 && (millis() - lastCommandMs_ >= MAX_RUN_MS)) {
+    stop();
+  }
 }
 
 int Actuator::getState(){

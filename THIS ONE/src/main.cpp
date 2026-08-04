@@ -27,7 +27,7 @@ int STEP_HZ = 800;
 
  
 //ACTUATOR VARIABLES
-int ACT_SPEED = 200;   // 0-255, default speed for jog commands
+int ACT_SPEED = 255;   // 0-255, default speed for jog commands
  
 
 //OTHER VARIABLES
@@ -102,6 +102,8 @@ void loop() {
     }
   }
 
+  actuator.update();
+  
   if (millis() - lastTelemetry >= TELEM_INTERVAL_MS) {
     lastTelemetry = millis();
     sendTelemetry();
