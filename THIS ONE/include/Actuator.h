@@ -16,5 +16,6 @@ private:
   int pwm_;
   int stby_;
   int state_;
+  uint32_t lastCommandMs_;
 };
 

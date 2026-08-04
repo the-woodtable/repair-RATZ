@@ -2,6 +2,7 @@
 #include "HookServo.h"
 #include "Stepper.h"
 #include "Actuator.h"
+#include "StereoCameras.h"
 
 //PINS
 int PIN_SERVO = 11;
@@ -13,12 +14,16 @@ int PIN_ACT_AIN1 = 7;
 int PIN_ACT_AIN2 = 8;
 int PIN_ACT_PWM  = 9;    // TB6612 PWMA — set to your actual pin
 int PIN_ACT_STBY = 10;   // TB6612 STBY — set to your actual pin
+
+int CAML_RX = 18;   // left cam U0T  -> S3
+int CAMR_RX = 16;   // right cam U0T -> S3
  
 
 //OBJECTS FROM CLASSES
 HookServo hookServo;
 Stepper stepper;
 Actuator actuator;
+StereoCameras cameras; 
  
 
 
@@ -39,7 +44,7 @@ uint32_t lastTelemetry = 0;
 
 
 void setup() {
-  Serial.begin(921600);
+  Serial.begin(460800);
 
   if (!hookServo.begin(PIN_SERVO)) {
     Serial.println("ERROR: hook servo failed to attach!");
@@ -54,28 +59,31 @@ void setup() {
     Serial.println("ERROR: actuator failed to attach!");
     setupSuccessful = false;
   }
+    if (!cameras.begin(CAML_RX, -1, CAMR_RX, -1)) { 
+    Serial.println("ERROR: camera buffers failed to attach!");
+    setupSuccessful = false; }
+
   
   
 }
 
 void sendTelemetry() {
-  Serial.print("{\"servo_angle\":");
-  Serial.print(hookServo.getCurrentAngle());
-  Serial.print(",\"stepper steps\":");
-  Serial.print(stepper.getStepCount());
-  Serial.print(",\"stepper direction\":");
-  Serial.print(stepper.getDrive());
-   Serial.print(",\"actuator state\":");
-  Serial.print(actuator.getState());
-  Serial.println("}");
+  char js[160];
+  snprintf(js, sizeof(js),
+    "{\"servo_angle\":%d,\"steps\":%ld,\"drv\":%d,\"act\":%d}",
+    hookServo.getCurrentAngle(), (long)stepper.getStepCount(),
+    stepper.getDrive(), actuator.getState());
+  cameras.sendTelemetryFrame(js);
 }
 
 void loop() {
+  cameras.update();
 
   while (Serial.available()) {
     char c = Serial.read();
 
     //blink light if setup successful
+    if (cameras.handleChar(c)) continue;
     if (!setupSuccessful) continue;
 
     switch (c) {
