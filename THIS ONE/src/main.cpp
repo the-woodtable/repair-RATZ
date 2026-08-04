@@ -4,6 +4,7 @@
 #include "Actuator.h"
 #include "StereoCameras.h"
 #include "IMU.h"
+#include "LED.h"
 
 //PINS
 int PIN_SERVO = 11;
@@ -22,13 +23,15 @@ int CAMR_RX = 16;   // right cam U0T -> S3
 int PIN_SDA = 13;
 int PIN_SCL = 14;
 
+int PIN_LED = 12;
+
 //OBJECTS FROM CLASSES
 HookServo hookServo;
 Stepper stepper;
 Actuator actuator;
 StereoCameras cameras; 
 IMU imu;
-
+LED strip;
 
 //STEPPER VARIABLES
 int STEP_HZ = 800;
@@ -69,6 +72,13 @@ void setup() {
   } if (!imu.begin(PIN_SDA, PIN_SCL)) {
   Serial.println("ERROR: IMU not found!");
   setupSuccessful = false;}
+
+
+  if (!strip.begin(PIN_LED)) {
+    Serial.println("ERROR: LED failed to attach!");
+    setupSuccessful = false;
+  }
+  
   
   
 }
@@ -115,7 +125,10 @@ void loop() {
 
       // -- IMU --
       case 'Z': stepper.zero(); imu.zero(); break;
- 
+     // -- LED --
+      case 'L': strip.on();  break;
+      case 'O': strip.off(); break;
+
 
       default:
         break;   // ignore unrecognized characters
