@@ -14,7 +14,7 @@ HookServo hookServo;
 Stepper stepper;
 
 
-//STEPPER VARIABLES
+//STEPPER VARIABLESf
 int STEP_HZ = 800;
 
 
