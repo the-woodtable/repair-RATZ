@@ -43,7 +43,7 @@
 
 class StereoCameras {
 public:
-  static const uint32_t CAM_BAUD = 921600;   // MUST equal Serial.begin() in
+  static const uint32_t CAM_BAUD = 460800;   // MUST equal Serial.begin() in
                                              // camera_firmware.ino. Change one,
                                              // change the other, reflash BOTH.
 
