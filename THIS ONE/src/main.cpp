@@ -1,11 +1,21 @@
 #include <Arduino.h>
 #include "HookServo.h"
 
+//PINS
 int PIN_SERVO = 11;
 
+
+//OBJECTS FROM CLASSES
+HookServo hookServo;
+
+
+//OTHER VARIABLES
 bool setupSuccessful = true;
 
-HookServo hookServo;
+const uint32_t TELEM_INTERVAL_MS = 200;   // 5 Hz
+uint32_t lastTelemetry = 0;
+
+
 
 void setup() {
   Serial.begin(921600);
@@ -15,15 +25,24 @@ void setup() {
     setupSuccessful = false;
   }
 
+  
+}
+
+void sendTelemetry() {
+  Serial.print("{\"servo_angle\":");
+  Serial.print(hookServo.getCurrentAngle());
+  //Serial.print(",\"steps\":");
+  //Serial.print(stepper.getStepCount());
+  Serial.println("}");
 }
 
 void loop() {
-  // hookServo.setAngle(180);
-  // delay(1000);
-  // hookServo.setAngle(0);
-  // delay(1000);
+
   while (Serial.available()) {
     char c = Serial.read();
+
+    //blink light if setup successful
+    if (!setupSuccessful) continue;
 
     switch (c) {
       case 'H':
@@ -38,6 +57,11 @@ void loop() {
       default:
         break;   // ignore unrecognized characters
     }
+  }
+
+  if (millis() - lastTelemetry >= TELEM_INTERVAL_MS) {
+    lastTelemetry = millis();
+    sendTelemetry();
   }
 }
 
