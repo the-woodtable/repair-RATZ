@@ -78,6 +78,15 @@ void setup() {
     Serial.println("ERROR: LED failed to attach!");
     setupSuccessful = false;
   }
+    // Blink LED twice to confirm setup completed successfully
+  if (setupSuccessful) {
+    for (int i = 0; i < 2; i++) {
+      strip.on();
+      delay(150);
+      strip.off();
+      delay(150);
+    }
+  }
   
   
   
