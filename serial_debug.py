@@ -4,10 +4,16 @@ serial_debug.py — what is actually arriving from the S3?
 Run with the panel CLOSED (only one program can hold the port):
 
     python3 serial_debug.py
-    python3 serial_debug.py /dev/cu.usbserial-1140    # specific port
+    python3 serial_debug.py /dev/cu.usbserial-1140         # specific port
+    python3 serial_debug.py /dev/cu.usbserial-1140 115200  # boot-message mode
 
 Listens 10 s and reports every layer: heartbeats, telemetry, camera frames,
 and whether those frames would pass the panel's JPEG check.
+
+BOOT-MESSAGE MODE: pass 115200 as the second argument. Every ESP32 prints a
+boot banner at 115200 on reset, whatever the sketch later sets. If you see
+readable text there, the chip is alive — which separates "board is dead"
+from "board is running but not streaming".
 """
 
 import struct
@@ -17,8 +23,8 @@ import time
 import serial
 from serial.tools import list_ports
 
-BAUD = 921600
 PORT = sys.argv[1] if len(sys.argv) > 1 else None
+BAUD = int(sys.argv[2]) if len(sys.argv) > 2 else 921600
 
 # id byte -> stream name (robot/camera-only firmware uses 0/1/2; the very
 # old bench sketch used b'L'/b'R')
@@ -42,7 +48,11 @@ def main():
     if not port:
         print("No serial port found — check the USB cable (must be a data cable).")
         return
-    print(f"Listening on {port} for 10 s...\n")
+    print(f"Listening on {port} at {BAUD} baud for 10 s...")
+    if BAUD == 115200:
+        print("(boot-message mode — power-cycle or reset the board NOW)\n")
+    else:
+        print()
     ser = serial.Serial(port, BAUD, timeout=0.1)
     data = bytearray()
     t0 = time.time()
@@ -52,6 +62,25 @@ def main():
     data = bytes(data)
 
     print(f"total bytes: {len(data)}  ({len(data) / 10:.0f} B/s)")
+
+    # Boot-message mode: just show whatever text arrived.
+    if BAUD == 115200:
+        text = data.decode("ascii", "replace")
+        printable = sum(32 <= b < 127 or b in (10, 13) for b in data)
+        print("--- raw text ---")
+        print(text if text else "(nothing)")
+        print("--- end ---")
+        if data and printable > len(data) * 0.6:
+            print("-> Readable boot text: THE CHIP IS ALIVE. It's a firmware "
+                  "or sensor problem, not a dead board.")
+        elif data:
+            print("-> Bytes but not readable text: try power-cycling during "
+                  "the 10 s window; otherwise suspect the board.")
+        else:
+            print("-> Nothing even at 115200: board is not running "
+                  "(check 5V/GND at the board, then suspect damage).")
+        return
+
     if not data:
         print("-> NOTHING arriving. S3 side: wrong port, USB CDC On Boot "
               "disabled, or sketch not flashed/running.")
