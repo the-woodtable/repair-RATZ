@@ -45,7 +45,9 @@
 static const uint8_t MAGIC[2] = {0xAA, 0x55};
 
 void setup() {
-  Serial.begin(921600);
+  Serial.begin(460800);   // MUST equal CAM_BAUD in THIS ONE/include/StereoCameras.h
+                          // (currently 460800). Change one -> change the other,
+                          // and reflash BOTH the camera and the S3.
 
   camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -67,9 +69,21 @@ void setup() {
                                     // (mostly-grey images) and low fps.
   config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size   = FRAMESIZE_QVGA;   // 320x240 — keep! stereo calib assumes this
-  config.jpeg_quality = 20;               // ~8-15 KB/frame -> ~6-10 fps at 921600 baud
-  config.fb_count     = 2;
-  config.grab_mode    = CAMERA_GRAB_LATEST;
+
+  // Frame buffers: 2 buffers need PSRAM. Without PSRAM the allocation
+  // quietly falls short -> truncated (grey-bottom) frames and the same
+  // stale buffer returned forever. So adapt to what the board has:
+  if (psramFound()) {
+    config.jpeg_quality = 20;             // ~5-10 KB/frame
+    config.fb_count     = 2;
+    config.fb_location  = CAMERA_FB_IN_PSRAM;
+    config.grab_mode    = CAMERA_GRAB_LATEST;
+  } else {
+    config.jpeg_quality = 22;             // smaller frames to fit in DRAM
+    config.fb_count     = 1;
+    config.fb_location  = CAMERA_FB_IN_DRAM;
+    config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+  }
 
   if (esp_camera_init(&config) != ESP_OK) {
     // Camera failed — blink onboard flash LED (GPIO4) forever
