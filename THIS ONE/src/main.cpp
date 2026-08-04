@@ -18,6 +18,10 @@ void setup() {
 }
 
 void loop() {
+  // hookServo.setAngle(180);
+  // delay(1000);
+  // hookServo.setAngle(0);
+  // delay(1000);
   while (Serial.available()) {
     char c = Serial.read();
 
