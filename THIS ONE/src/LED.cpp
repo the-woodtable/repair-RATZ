@@ -12,21 +12,23 @@ bool LED::begin(int lightpin) {
 }
 
 void LED::on() {
-    set(true);
+    digitalWrite(_pin, HIGH);
+    _state = true;
 }
 
 void LED::off() {
-    set(false);
+    digitalWrite(_pin, LOW);
+    _state = false;
 }
 
 void LED::toggle() {
-    set(!_state);
-}
-
-void LED::set(bool state) {
-    if (_pin < 0) return;      // begin() was never called
-    _state = state;
-    digitalWrite(_pin, _state ? HIGH : LOW);
+    if(_state){
+        digitalWrite(_pin, LOW);
+    }
+    else{
+        digitalWrite(_pin, HIGH);
+    }
+        
 }
 
 bool LED::isOn() const { return _state; }

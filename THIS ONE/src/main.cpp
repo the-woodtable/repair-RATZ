@@ -31,7 +31,7 @@ Stepper stepper;
 Actuator actuator;
 StereoCameras cameras; 
 IMU imu;
-LED strip;
+LED led;
 
 //STEPPER VARIABLES
 int STEP_HZ = 800;
@@ -74,36 +74,54 @@ void setup() {
   setupSuccessful = false;}
 
 
-  if (!strip.begin(PIN_LED)) {
+  if (!led.begin(PIN_LED)) {
     Serial.println("ERROR: LED failed to attach!");
     setupSuccessful = false;
   }
+
+
     // Blink LED twice to confirm setup completed successfully
-  if (setupSuccessful) {
+  if (true) {
     for (int i = 0; i < 2; i++) {
-      strip.on();
-      delay(150);
-      strip.off();
-      delay(150);
+      led.on();
+      delay(500);
+      led.off();
+      delay(500);
     }
   }
   
   
-  
 }
-
 void sendTelemetry() {
-  char js[160];
-  snprintf(js, sizeof(js),
-    "{\"servo_angle\":%d,\"steps\":%ld,\"drv\":%d,\"act\":%d,"
-    "\"imu_pos\":%.4f,\"imu_vel\":%.4f,\"imu_bias\":%.5f,\"slip\":%d}",
-    hookServo.getCurrentAngle(), (long)stepper.getStepCount(),
-    stepper.getDrive(), actuator.getState(),
-    imu.getPosition(), imu.getVelocity(), imu.getBias(), imu.isSlipping());
-  cameras.sendTelemetryFrame(js);
+  Serial.print("{\"servo_angle\":");
+  Serial.print(hookServo.getCurrentAngle());
+
+  Serial.print("{\"steps\":");
+  Serial.print(stepper.getStepCount());
+  
+  Serial.print("{\"stepper_drive_dir\":");
+  Serial.print(stepper.getDrive());
+  
+  Serial.print("{\"actuator\":");
+  Serial.print(actuator.getState());
+
+  Serial.print("{\"imu_pos\":");
+  Serial.print(imu.getPosition());
+
+  Serial.print("{\"imu_vel\":");
+  Serial.print(imu.getVelocity());
+  
+  Serial.print("{\"imu_bias\":");
+  Serial.print(imu.getBias());
+  
+  Serial.print("{\"slip\":");
+  Serial.print(imu.isSlipping());
+
+  Serial.println("}");
 }
 
 void loop() {
+
   cameras.update();
   imu.setDriveActive(stepper.getDrive() != 0);
   imu.update();
@@ -112,8 +130,6 @@ void loop() {
     char c = Serial.read();
 
     //blink light if setup successful
-    if (cameras.handleChar(c)) continue;
-    if (!setupSuccessful) continue;
 
     switch (c) {
 
@@ -134,9 +150,10 @@ void loop() {
 
       // -- IMU --
       case 'Z': stepper.zero(); imu.zero(); break;
+
      // -- LED --
-      case 'L': strip.on();  break;
-      case 'O': strip.off(); break;
+      case 'L': led.on();  break;
+      case 'O': led.off(); break;
 
 
       default:
@@ -147,8 +164,8 @@ void loop() {
   actuator.update();
   
   if (millis() - lastTelemetry >= TELEM_INTERVAL_MS) {
-    lastTelemetry = millis();
-    sendTelemetry();
+     lastTelemetry = millis();
+     sendTelemetry();
   }
 }
 

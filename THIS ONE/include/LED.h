@@ -8,7 +8,6 @@ public:
     void on();
     void off();
     void toggle();
-    void set(bool state);
 
     bool isOn() const;
     int  pin() const;
