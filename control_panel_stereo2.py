@@ -45,9 +45,12 @@ BAUD   = 921600        # ignored by USB CDC but pyserial requires it
 SCALE  = 2             # display zoom (320x240 -> 640x480)
 
 CALIB_FILE  = os.path.join(HERE, "stereo_calib.npz")
-REC_DIR     = os.path.expanduser("~/Downloads/pipe_cam_recordings")
-DATASET_DIR = os.path.expanduser("~/Downloads/pipe_cam_dataset")
-CALIB_DIR   = os.path.expanduser("~/Downloads/pipe_cam_calib_pairs")
+# All captured data lives under one folder in the course directory so it
+# is easy to find, back up, and hand in.
+DATA_DIR    = os.path.expanduser("~/Desktop/30.007/pipe_cam_data")
+REC_DIR     = os.path.join(DATA_DIR, "recordings")
+DATASET_DIR = os.path.join(DATA_DIR, "dataset")
+CALIB_DIR   = os.path.join(DATA_DIR, "calib_pairs")
 
 REC_FPS      = 10
 AUTOCAP_SECS = 1.0

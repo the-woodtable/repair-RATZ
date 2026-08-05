@@ -47,7 +47,8 @@ PORT = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None
 BAUD = int(sys.argv[2]) if len(sys.argv) > 2 else 921600
 SECONDS = int(sys.argv[3]) if len(sys.argv) > 3 else 10
 
-SAMPLE_DIR = os.path.expanduser("~/Downloads/pipe_cam_quality_samples")
+DATA_DIR   = os.path.expanduser("~/Desktop/30.007/pipe_cam_data")
+SAMPLE_DIR = os.path.join(DATA_DIR, "quality_samples")
 MAX_FRAME = 300_000
 CAM_IDS = {b"\x00": "L", b"\x01": "R", b"L": "L", b"R": "R"}
 
@@ -250,7 +251,16 @@ def main():
         print("   pip install opencv-python numpy   )")
         return
 
-    metrics = [m for m in (image_metrics(j) for _, j in frames) if m]
+    # Keep the camera id with each measurement so left and right can be
+    # compared — that's how you verify both cameras really do have the same
+    # fixed exposure/gain/white-balance settings.
+    per_cam = {}
+    metrics = []
+    for cam, j in frames:
+        m = image_metrics(j)
+        if m:
+            metrics.append(m)
+            per_cam.setdefault(cam, []).append(m)
     if not metrics:
         print("No frame decoded — all corrupt.")
         return
@@ -271,6 +281,38 @@ def main():
     bad_bottom = sum(1 for v in fb if v > 5)
     print(f"gray-bottom    : {bad_bottom}/{len(metrics)} frames have >5% "
           f"flat bottom rows (truncated captures)")
+
+    # ---- LEFT vs RIGHT: do the two cameras actually match? ----
+    # With fixed exposure/gain/white-balance both cameras should report very
+    # similar brightness and contrast on the same scene. Big gaps mean the
+    # settings differ (one camera flashed from a different build?) or one
+    # sensor is misbehaving. Stereo matching needs them to agree.
+    if len(per_cam) >= 2:
+        print()
+        print("--- left vs right (should be CLOSE for stereo) ---")
+        print(f"{'':14} {'LEFT':>8} {'RIGHT':>8}   {'diff':>6}")
+        rows = [("brightness", "brightness"), ("contrast", "contrast"),
+                ("sharpness", "sharpness")]
+        worst = 0.0
+        for label, key in rows:
+            l = statistics.median([m[key] for m in per_cam.get("L", [])] or [0])
+            r = statistics.median([m[key] for m in per_cam.get("R", [])] or [0])
+            denom = max(abs(l), abs(r), 1e-6)
+            rel = 100 * abs(l - r) / denom
+            if label in ("brightness", "contrast"):
+                worst = max(worst, rel)
+            print(f"{label:14} {l:8.0f} {r:8.0f}   {rel:5.0f}%")
+        if worst < 15:
+            print("-> cameras MATCH. Good for stereo matching and calibration.")
+        elif worst < 40:
+            print("-> noticeable difference. Check both cameras were flashed "
+                  "from the SAME firmware file.")
+        else:
+            print("-> cameras DISAGREE badly. Either auto-exposure/AWB is "
+                  "still enabled, they were flashed from different builds, "
+                  "or one is pointing at a very different scene.")
+        print("   (sharpness legitimately differs if the two lenses are "
+              "focused differently — that one is informational)")
 
     # Save evidence
     os.makedirs(SAMPLE_DIR, exist_ok=True)

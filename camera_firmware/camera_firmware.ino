@@ -78,6 +78,17 @@ static const uint8_t MAGIC[2] = { 0xAA, 0x55 };
 // 1 = diagnostic mode, 0 = normal operation.
 #define REINIT_BLINK 0
 
+// --- FIXED EXPOSURE / GAIN (see applyFixedImageSettings) ---
+// Both cameras are flashed from this file, so these are identical on both
+// by construction — that is the whole point. Tune for YOUR lighting, then
+// reflash BOTH cameras and re-run stream_quality.py to confirm the L and R
+// brightness figures now match.
+//   too dark  -> raise FIXED_EXPOSURE first, then FIXED_GAIN
+//   too noisy -> lower FIXED_GAIN (gain amplifies noise; exposure doesn't)
+//   motion blur in a moving robot -> lower exposure, raise gain
+#define FIXED_EXPOSURE 600    // 0-1200
+#define FIXED_GAIN     8      // 0-30
+
 // camera_config_t is moved to file scope (was local to setup() originally)
 // so that loop() can reuse the exact same config to re-init the sensor
 // without needing to duplicate/rebuild it.
@@ -111,6 +122,8 @@ bool writeWithTimeout(const uint8_t *data, size_t len, uint32_t timeout_ms) {
   }
   return true;
 }
+
+void applyFixedImageSettings();   // defined below setup()
 
 void setup() {
   Serial.begin(460800);
@@ -186,6 +199,49 @@ void setup() {
       delay(900);
     }
   }
+
+  applyFixedImageSettings();
+}
+
+// ---------------------------------------------------------------------
+// LOCK the image pipeline so BOTH cameras produce identically-exposed,
+// identically-coloured frames.
+//
+// Why this matters: left on auto, each sensor independently chooses its own
+// exposure, gain and white balance. In a dim pipe they diverge wildly (one
+// olive, one lilac). That breaks three things at once:
+//   * stereo matching compares left/right patches — mismatched colour and
+//     brightness make disparity (and therefore distance) unreliable
+//   * checkerboard corner detection during calibration
+//   * YOLO training data consistency
+//
+// Because both cameras are flashed from THIS FILE, these constants are
+// identical on both by construction. Never hand-tune one camera only.
+// ---------------------------------------------------------------------
+void applyFixedImageSettings() {
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) return;
+
+  // --- auto everything OFF ---
+  s->set_whitebal(s, 0);      // auto white balance off
+  s->set_awb_gain(s, 0);      // auto white balance gain off
+  s->set_exposure_ctrl(s, 0); // auto exposure off
+  s->set_aec2(s, 0);          // "night mode" / extended AEC off
+  s->set_gain_ctrl(s, 0);     // auto gain off
+
+  // --- fixed values (TUNE THESE, then reflash BOTH cameras) ---
+  s->set_aec_value(s, FIXED_EXPOSURE);  // 0-1200, higher = brighter
+  s->set_agc_gain(s, FIXED_GAIN);       // 0-30,  higher = brighter + noisier
+  s->set_brightness(s, 0);              // -2..2
+  s->set_contrast(s, 0);                // -2..2
+  s->set_saturation(s, 0);              // -2..2
+
+  // --- correction features: keep identical, they affect appearance ---
+  s->set_bpc(s, 1);           // bad pixel correction
+  s->set_wpc(s, 1);           // white pixel correction
+  s->set_lenc(s, 1);          // lens shading correction
+  s->set_hmirror(s, 0);
+  s->set_vflip(s, 0);
 }
 
 void loop() {
