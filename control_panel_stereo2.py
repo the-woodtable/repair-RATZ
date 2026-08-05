@@ -45,13 +45,20 @@ BAUD   = 921600        # ignored by USB CDC but pyserial requires it
 SCALE  = 2             # display zoom (320x240 -> 640x480)
 
 CALIB_FILE  = os.path.join(HERE, "stereo_calib.npz")
-REC_DIR     = os.path.expanduser("~/Downloads/pipe_cam_recordings")
-DATASET_DIR = os.path.expanduser("~/Downloads/pipe_cam_dataset")
-CALIB_DIR   = os.path.expanduser("~/Downloads/pipe_cam_calib_pairs")
+# All captured data lives under one folder in the course directory so it
+# is easy to find, back up, and hand in.
+DATA_DIR    = os.path.expanduser("~/Desktop/30.007/pipe_cam_data")
+REC_DIR     = os.path.join(DATA_DIR, "recordings")
+DATASET_DIR = os.path.join(DATA_DIR, "dataset")
+CALIB_DIR   = os.path.join(DATA_DIR, "calib_pairs")
 
 REC_FPS      = 10
 AUTOCAP_SECS = 1.0
 PAIR_MAX_AGE = 0.30    # L/R further apart than this = unsynced
+# Reject a decoded frame if more than this fraction of its bottom rows are
+# flat grey — that's a truncated capture. 0.05 = 5%. Raise toward 0.5 if
+# you'd rather see partial frames than have the display freeze.
+MAX_FLAT_BOTTOM = 0.05
 
 
 # ============================ SERIAL ============================
@@ -168,6 +175,24 @@ class FrameLink:
             except queue.Full:
                 pass
 
+    @staticmethod
+    def _flat_bottom_frac(img):
+        """Fraction of rows at the BOTTOM that are a single flat value.
+
+        A truncated capture decodes to real image on top and uniform grey
+        below. Byte-level checks can't catch these (the JPEG may still end
+        with a valid FFD9), so this is the only reliable filter.
+        """
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        row_std = gray.std(axis=1)
+        flat = 0
+        for v in row_std[::-1]:
+            if v < 2.0:
+                flat += 1
+            else:
+                break
+        return flat / gray.shape[0]
+
     def _decoder(self):
         while self.running:
             try:
@@ -175,10 +200,17 @@ class FrameLink:
             except queue.Empty:
                 continue
             img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
-            if img is not None:
-                with self.lock:
-                    self.latest[cam] = (img, ts)
-                    self.counts[cam] += 1
+            if img is None:
+                self.dropped += 1
+                continue
+            # Drop truncated captures instead of showing grey-bottom frames.
+            # The display then simply holds the last good image.
+            if self._flat_bottom_frac(img) > MAX_FLAT_BOTTOM:
+                self.dropped += 1
+                continue
+            with self.lock:
+                self.latest[cam] = (img, ts)
+                self.counts[cam] += 1
 
     def get_pair(self):
         with self.lock:

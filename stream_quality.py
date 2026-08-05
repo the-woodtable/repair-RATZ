@@ -43,17 +43,18 @@ try:
 except ImportError:
     HAVE_CV = False
 
-PORT = sys.argv[1] if len(sys.argv) > 1 else None
+PORT = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None
 BAUD = int(sys.argv[2]) if len(sys.argv) > 2 else 921600
 SECONDS = int(sys.argv[3]) if len(sys.argv) > 3 else 10
 
-SAMPLE_DIR = os.path.expanduser("~/Downloads/pipe_cam_quality_samples")
+DATA_DIR   = os.path.expanduser("~/Desktop/30.007/pipe_cam_data")
+SAMPLE_DIR = os.path.join(DATA_DIR, "quality_samples")
 MAX_FRAME = 300_000
 CAM_IDS = {b"\x00": "L", b"\x01": "R", b"L": "L", b"R": "R"}
 
 
 def find_port():
-    if PORT:
+    if PORT:                       # "" means "auto-detect but I passed baud"
         return PORT
     cands = [p.device for p in list_ports.comports()
              if any(k in p.device.lower()
@@ -63,14 +64,18 @@ def find_port():
     return cands[0] if cands else None
 
 
-def parse_frames(data):
+def parse_frames(data, gaps=None):
     """Extract JPEG payloads from a capture. Handles BOTH formats:
     tagged (via S3: AA55 id len payload) and untagged (camera direct:
     AA55 len payload). Returns (frames, corrupt_count) where frames is
-    a list of (cam_id, jpeg_bytes)."""
+    a list of (cam_id, jpeg_bytes).
+
+    If `gaps` is a list, byte ranges that were NOT part of any frame get
+    appended to it — that's how we find out what the unparsed traffic is."""
     frames, corrupt = [], 0
     i = 0
     n = len(data)
+    last_end = 0
     while True:
         i = data.find(b"\xAA\x55", i)
         if i < 0 or i + 6 > n:
@@ -79,6 +84,18 @@ def parse_frames(data):
         # Try tagged first: id byte then length
         parsed = False
         raw_id = data[i + 2:i + 3]
+
+        # Telemetry (id 2) is legitimate traffic, not junk — consume it so it
+        # doesn't inflate the "unaccounted" figure.
+        if raw_id == b"\x02" and i + 7 <= n:
+            (tlen,) = struct.unpack("<I", data[i + 3:i + 7])
+            if 0 < tlen < 1000 and i + 7 + tlen <= n:
+                if gaps is not None and i > last_end:
+                    gaps.append(data[last_end:i])
+                i += 7 + tlen
+                last_end = i
+                continue
+
         if raw_id in CAM_IDS and i + 7 <= n:
             (length,) = struct.unpack("<I", data[i + 3:i + 7])
             if 0 < length <= MAX_FRAME:
@@ -88,7 +105,10 @@ def parse_frames(data):
                         frames.append((CAM_IDS[raw_id], payload))
                     else:
                         corrupt += 1
+                    if gaps is not None and i > last_end:
+                        gaps.append(data[last_end:i])
                     i += 7 + length
+                    last_end = i
                     parsed = True
 
         # Untagged: length immediately after magic
@@ -106,6 +126,8 @@ def parse_frames(data):
 
         if not parsed:
             i += 2
+    if gaps is not None and last_end < n:
+        gaps.append(data[last_end:])
     return frames, corrupt
 
 
@@ -148,7 +170,8 @@ def main():
     ser.close()
     data = bytes(data)
 
-    frames, corrupt = parse_frames(data)
+    gaps = []
+    frames, corrupt = parse_frames(data, gaps)
     total = len(frames) + corrupt
 
     print()
@@ -171,6 +194,46 @@ def main():
             by_cam[cam] = by_cam.get(cam, 0) + 1
         print(f"per camera     : {by_cam}")
 
+    # Bytes that never became a frame. A little is normal (partial frame at
+    # the start/end of the capture window). A LOT means the stream is badly
+    # desynced — the parser is throwing away most of what arrives.
+    accounted = sum(sizes) + (len(frames) + corrupt) * 7
+    unaccounted = max(0, len(data) - accounted)
+    print(f"unaccounted    : {unaccounted/1000:.1f} KB "
+          f"({100*unaccounted/len(data):.0f}% of traffic never parsed as a frame)")
+
+    if len(frames) < 20:
+        print(f"\n!! only {len(frames)} frames in {SECONDS}s — too few to draw "
+              f"conclusions from.\n   Re-run with a longer window, e.g.:  "
+              f"python3 stream_quality.py '' {BAUD} 60")
+
+    # If most traffic isn't frames, SHOW what it is. Readable text here means
+    # the S3 is printing/crash-looping; binary noise means a framing problem.
+    if unaccounted > len(data) * 0.2 and gaps:
+        blob = b"".join(gaps)
+        printable = sum(32 <= b < 127 or b in (9, 10, 13) for b in blob)
+        pct_text = 100 * printable / max(1, len(blob))
+        print(f"\n--- what the unparsed {unaccounted/1000:.0f} KB looks like "
+              f"({pct_text:.0f}% printable text) ---")
+        sample = blob[:400].decode("ascii", "replace")
+        sample = "".join(c if (32 <= ord(c) < 127 or c in "\n\r\t") else "."
+                         for c in sample)
+        print(sample)
+        if len(blob) > 800:
+            mid = blob[len(blob)//2:len(blob)//2 + 300].decode("ascii", "replace")
+            mid = "".join(c if (32 <= ord(c) < 127 or c in "\n\r\t") else "."
+                          for c in mid)
+            print("...[middle of capture]...")
+            print(mid)
+        print("--- end sample ---")
+        if pct_text > 50:
+            print("-> Mostly TEXT: the S3 is printing something (boot banners, "
+                  "panic messages, or stray Serial.print) into the binary "
+                  "stream. Find and remove it — or it's crash-looping.")
+        else:
+            print("-> Mostly BINARY: frame data the parser can't sync to. "
+                  "Suspect corrupted length fields or interleaved writes.")
+
     print()
     print("================ IMAGE ====================")
     if not HAVE_CV:
@@ -188,7 +251,16 @@ def main():
         print("   pip install opencv-python numpy   )")
         return
 
-    metrics = [m for m in (image_metrics(j) for _, j in frames) if m]
+    # Keep the camera id with each measurement so left and right can be
+    # compared — that's how you verify both cameras really do have the same
+    # fixed exposure/gain/white-balance settings.
+    per_cam = {}
+    metrics = []
+    for cam, j in frames:
+        m = image_metrics(j)
+        if m:
+            metrics.append(m)
+            per_cam.setdefault(cam, []).append(m)
     if not metrics:
         print("No frame decoded — all corrupt.")
         return
@@ -209,6 +281,38 @@ def main():
     bad_bottom = sum(1 for v in fb if v > 5)
     print(f"gray-bottom    : {bad_bottom}/{len(metrics)} frames have >5% "
           f"flat bottom rows (truncated captures)")
+
+    # ---- LEFT vs RIGHT: do the two cameras actually match? ----
+    # With fixed exposure/gain/white-balance both cameras should report very
+    # similar brightness and contrast on the same scene. Big gaps mean the
+    # settings differ (one camera flashed from a different build?) or one
+    # sensor is misbehaving. Stereo matching needs them to agree.
+    if len(per_cam) >= 2:
+        print()
+        print("--- left vs right (should be CLOSE for stereo) ---")
+        print(f"{'':14} {'LEFT':>8} {'RIGHT':>8}   {'diff':>6}")
+        rows = [("brightness", "brightness"), ("contrast", "contrast"),
+                ("sharpness", "sharpness")]
+        worst = 0.0
+        for label, key in rows:
+            l = statistics.median([m[key] for m in per_cam.get("L", [])] or [0])
+            r = statistics.median([m[key] for m in per_cam.get("R", [])] or [0])
+            denom = max(abs(l), abs(r), 1e-6)
+            rel = 100 * abs(l - r) / denom
+            if label in ("brightness", "contrast"):
+                worst = max(worst, rel)
+            print(f"{label:14} {l:8.0f} {r:8.0f}   {rel:5.0f}%")
+        if worst < 15:
+            print("-> cameras MATCH. Good for stereo matching and calibration.")
+        elif worst < 40:
+            print("-> noticeable difference. Check both cameras were flashed "
+                  "from the SAME firmware file.")
+        else:
+            print("-> cameras DISAGREE badly. Either auto-exposure/AWB is "
+                  "still enabled, they were flashed from different builds, "
+                  "or one is pointing at a very different scene.")
+        print("   (sharpness legitimately differs if the two lenses are "
+              "focused differently — that one is informational)")
 
     # Save evidence
     os.makedirs(SAMPLE_DIR, exist_ok=True)
