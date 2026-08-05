@@ -43,7 +43,7 @@ try:
 except ImportError:
     HAVE_CV = False
 
-PORT = sys.argv[1] if len(sys.argv) > 1 else None
+PORT = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None
 BAUD = int(sys.argv[2]) if len(sys.argv) > 2 else 921600
 SECONDS = int(sys.argv[3]) if len(sys.argv) > 3 else 10
 
@@ -53,7 +53,7 @@ CAM_IDS = {b"\x00": "L", b"\x01": "R", b"L": "L", b"R": "R"}
 
 
 def find_port():
-    if PORT:
+    if PORT:                       # "" means "auto-detect but I passed baud"
         return PORT
     cands = [p.device for p in list_ports.comports()
              if any(k in p.device.lower()
@@ -63,14 +63,18 @@ def find_port():
     return cands[0] if cands else None
 
 
-def parse_frames(data):
+def parse_frames(data, gaps=None):
     """Extract JPEG payloads from a capture. Handles BOTH formats:
     tagged (via S3: AA55 id len payload) and untagged (camera direct:
     AA55 len payload). Returns (frames, corrupt_count) where frames is
-    a list of (cam_id, jpeg_bytes)."""
+    a list of (cam_id, jpeg_bytes).
+
+    If `gaps` is a list, byte ranges that were NOT part of any frame get
+    appended to it — that's how we find out what the unparsed traffic is."""
     frames, corrupt = [], 0
     i = 0
     n = len(data)
+    last_end = 0
     while True:
         i = data.find(b"\xAA\x55", i)
         if i < 0 or i + 6 > n:
@@ -79,6 +83,18 @@ def parse_frames(data):
         # Try tagged first: id byte then length
         parsed = False
         raw_id = data[i + 2:i + 3]
+
+        # Telemetry (id 2) is legitimate traffic, not junk — consume it so it
+        # doesn't inflate the "unaccounted" figure.
+        if raw_id == b"\x02" and i + 7 <= n:
+            (tlen,) = struct.unpack("<I", data[i + 3:i + 7])
+            if 0 < tlen < 1000 and i + 7 + tlen <= n:
+                if gaps is not None and i > last_end:
+                    gaps.append(data[last_end:i])
+                i += 7 + tlen
+                last_end = i
+                continue
+
         if raw_id in CAM_IDS and i + 7 <= n:
             (length,) = struct.unpack("<I", data[i + 3:i + 7])
             if 0 < length <= MAX_FRAME:
@@ -88,7 +104,10 @@ def parse_frames(data):
                         frames.append((CAM_IDS[raw_id], payload))
                     else:
                         corrupt += 1
+                    if gaps is not None and i > last_end:
+                        gaps.append(data[last_end:i])
                     i += 7 + length
+                    last_end = i
                     parsed = True
 
         # Untagged: length immediately after magic
@@ -106,6 +125,8 @@ def parse_frames(data):
 
         if not parsed:
             i += 2
+    if gaps is not None and last_end < n:
+        gaps.append(data[last_end:])
     return frames, corrupt
 
 
@@ -148,7 +169,8 @@ def main():
     ser.close()
     data = bytes(data)
 
-    frames, corrupt = parse_frames(data)
+    gaps = []
+    frames, corrupt = parse_frames(data, gaps)
     total = len(frames) + corrupt
 
     print()
@@ -170,6 +192,46 @@ def main():
         for cam, _ in frames:
             by_cam[cam] = by_cam.get(cam, 0) + 1
         print(f"per camera     : {by_cam}")
+
+    # Bytes that never became a frame. A little is normal (partial frame at
+    # the start/end of the capture window). A LOT means the stream is badly
+    # desynced — the parser is throwing away most of what arrives.
+    accounted = sum(sizes) + (len(frames) + corrupt) * 7
+    unaccounted = max(0, len(data) - accounted)
+    print(f"unaccounted    : {unaccounted/1000:.1f} KB "
+          f"({100*unaccounted/len(data):.0f}% of traffic never parsed as a frame)")
+
+    if len(frames) < 20:
+        print(f"\n!! only {len(frames)} frames in {SECONDS}s — too few to draw "
+              f"conclusions from.\n   Re-run with a longer window, e.g.:  "
+              f"python3 stream_quality.py '' {BAUD} 60")
+
+    # If most traffic isn't frames, SHOW what it is. Readable text here means
+    # the S3 is printing/crash-looping; binary noise means a framing problem.
+    if unaccounted > len(data) * 0.2 and gaps:
+        blob = b"".join(gaps)
+        printable = sum(32 <= b < 127 or b in (9, 10, 13) for b in blob)
+        pct_text = 100 * printable / max(1, len(blob))
+        print(f"\n--- what the unparsed {unaccounted/1000:.0f} KB looks like "
+              f"({pct_text:.0f}% printable text) ---")
+        sample = blob[:400].decode("ascii", "replace")
+        sample = "".join(c if (32 <= ord(c) < 127 or c in "\n\r\t") else "."
+                         for c in sample)
+        print(sample)
+        if len(blob) > 800:
+            mid = blob[len(blob)//2:len(blob)//2 + 300].decode("ascii", "replace")
+            mid = "".join(c if (32 <= ord(c) < 127 or c in "\n\r\t") else "."
+                          for c in mid)
+            print("...[middle of capture]...")
+            print(mid)
+        print("--- end sample ---")
+        if pct_text > 50:
+            print("-> Mostly TEXT: the S3 is printing something (boot banners, "
+                  "panic messages, or stray Serial.print) into the binary "
+                  "stream. Find and remove it — or it's crash-looping.")
+        else:
+            print("-> Mostly BINARY: frame data the parser can't sync to. "
+                  "Suspect corrupted length fields or interleaved writes.")
 
     print()
     print("================ IMAGE ====================")

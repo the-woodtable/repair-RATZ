@@ -62,9 +62,14 @@ public:
   // Wrap a JSON string as a binary telemetry frame (id 2) the panel parses.
   void sendTelemetryFrame(const char* json);
 
+  // USB TX buffer. Must exceed the largest frame or every frame is skipped.
+  static const size_t TX_BUFFER_BYTES = 16384;
+
   // For telemetry / debugging.
   uint32_t framesLeft()  const { return left_.frames; }
   uint32_t framesRight() const { return right_.frames; }
+  // Frames dropped because the host wasn't draining USB fast enough.
+  uint32_t skipped() const { return left_.skipped + right_.skipped; }
 
 private:
   struct Channel {
@@ -74,6 +79,7 @@ private:
     uint32_t len = 0, got = 0;
     uint8_t* buf = nullptr;
     uint32_t frames = 0;
+    uint32_t skipped = 0;
 
     bool begin(HardwareSerial* s, int rxPin, int txPin, uint8_t camId);
     void pump();

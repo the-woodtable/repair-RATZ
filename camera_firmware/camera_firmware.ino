@@ -67,7 +67,16 @@ static const uint8_t MAGIC[2] = { 0xAA, 0x55 };
 // --- Recovery tuning constants ---
 #define WDT_TIMEOUT_S 5           // reboot if no full frame completes within this many seconds
 #define WRITE_TIMEOUT_MS 1000     // give up on a single Serial.write() burst after this long
-#define MAX_CONSECUTIVE_FAILS 5  // this many back-to-back fb_get() failures triggers a sensor re-init
+// How many back-to-back esp_camera_fb_get() failures before we assume the
+// sensor is wedged and do a full driver re-init. The re-init costs ~0.5 s,
+// so if the sensor merely stutters, a LOW value here throttles the frame
+// rate badly. The watchdog above is the real safety net, so this can be
+// generous. TEST: 5 (original) vs 100 — compare fps in stream_quality.py.
+#define MAX_CONSECUTIVE_FAILS 5
+
+// Flash the LED on each sensor re-init so you can SEE how often it happens.
+// 1 = diagnostic mode, 0 = normal operation.
+#define REINIT_BLINK 0
 
 // camera_config_t is moved to file scope (was local to setup() originally)
 // so that loop() can reuse the exact same config to re-init the sensor
@@ -138,9 +147,17 @@ void setup() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;  // OV5640 needs this. Lowering it to 10 MHz
-                                   // starves the sensor -> truncated frames
-                                   // (mostly-grey images) and low fps.
+  // 20 MHz. Measured over 60 s through the S3, long ribbons, both cameras:
+  //   10 MHz : 16.6 fps, 0% corrupt, 0/998  frames grey-bottom
+  //   20 MHz : 23.4 fps, 0% corrupt, 0/1403 frames grey-bottom  <-- best
+  //
+  // HISTORY, so nobody "re-fixes" this: earlier tests appeared to show that
+  // 20 MHz caused corruption and 10 MHz was cleaner. That was wrong. The
+  // corruption came from the S3 reading its camera UARTs one byte at a time,
+  // which saturated the CPU and overflowed the RX buffers. Once StereoCameras
+  // bulk-reads the frame body, BOTH clocks are perfectly clean and 20 MHz is
+  // simply faster. Sensor clock was never the problem.
+  config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size = FRAMESIZE_QVGA;  // 320x240 — keep! stereo calib assumes this
 
@@ -181,6 +198,16 @@ void loop() {
     // and only intervene once it's clearly not transient.
     consecutiveFails++;
     if (consecutiveFails > MAX_CONSECUTIVE_FAILS) {
+      // DIAGNOSTIC: flash the LED so re-inits are visible from across the
+      // bench. Frequent flashing = the sensor is failing often and this
+      // expensive teardown (~0.5 s each) is what's capping the frame rate.
+      // Set REINIT_BLINK to 0 once you've finished diagnosing.
+#if REINIT_BLINK
+      pinMode(4, OUTPUT);
+      digitalWrite(4, HIGH);
+      delay(40);
+      digitalWrite(4, LOW);
+#endif
       esp_camera_deinit();  // tear down the wedged driver/sensor state
       delay(100);
       esp_camera_init(&config);  // bring it back up fresh using the same config
@@ -206,6 +233,19 @@ void loop() {
   if (ok) ok = writeWithTimeout(fb->buf, fb->len, WRITE_TIMEOUT_MS);
 
   esp_camera_fb_return(fb);
+
+  // DIAGNOSTIC: flash the LED whenever a write times out. A timeout costs
+  // WRITE_TIMEOUT_MS (1 s!) AND leaves a half-sent frame on the wire, so
+  // frequent flashing here would explain both the ~1 fps and the truncated
+  // frames the panel keeps rejecting. Set REINIT_BLINK 0 when done.
+#if REINIT_BLINK
+  if (!ok) {
+    pinMode(4, OUTPUT);
+    digitalWrite(4, HIGH);
+    delay(40);
+    digitalWrite(4, LOW);
+  }
+#endif
 
   if (ok) {
     // Only reset the failure counter and feed the watchdog on a fully

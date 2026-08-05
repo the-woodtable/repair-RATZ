@@ -52,6 +52,21 @@ void StereoCameras::Channel::pump() {
         if (got == 0 && b != 0xFF) { state = 0; break; }
         if (got == 1 && b != 0xD8) { state = 0; break; }
         buf[got++] = b;
+
+        // BULK READ the rest of the body. Reading a 4 KB frame one byte at a
+        // time costs ~4000 driver calls; with two cameras that is ~70k calls
+        // per second, which starves the loop and overflows the UART buffers
+        // (bytes lost mid-frame -> grey-bottom images). readBytes() pulls
+        // whatever is already buffered in one go.
+        if (got >= 2 && got < len) {
+          int avail = ser->available();
+          if (avail > 0) {
+            uint32_t want = len - got;
+            if ((uint32_t)avail < want) want = avail;
+            got += ser->readBytes(buf + got, want);
+          }
+        }
+
         if (got == len) {
           emit();
           state = 0;
@@ -62,18 +77,55 @@ void StereoCameras::Channel::pump() {
   }
 }
 
+// Serial.write() on the native USB CDC can return SHORT when the host isn't
+// draining fast enough — it does not guarantee it wrote everything. Ignoring
+// that meant we announced "N bytes follow" and then sent fewer, so the PC
+// parser read past the end of the frame, swallowed the next frame's header,
+// and desynced. That showed up as most of the traffic being unparseable.
+// Always loop until the whole buffer is out.
+// Two hazards to avoid at once:
+//   1. Serial.write() on USB CDC can return SHORT. Ignoring that meant we
+//      announced "N bytes follow" and sent fewer, desyncing the PC parser.
+//   2. Waiting for the host to catch up BLOCKS the loop, and while we're
+//      blocked nobody drains the camera UARTs — their buffers overflow and
+//      the next frames arrive with bytes missing (grey-bottom images).
+// So: only start a frame if the whole thing already fits in the TX buffer.
+// If it doesn't, skip this frame entirely. A dropped frame is free; a
+// partial frame corrupts the stream, and blocking corrupts the other camera.
+static bool writeWhole(const uint8_t* hdr, size_t hlen,
+                       const uint8_t* body, size_t blen) {
+  if ((size_t)Serial.availableForWrite() < hlen + blen) return false;
+  size_t sent = 0;
+  while (sent < hlen) {                       // fits, so these complete
+    size_t n = Serial.write(hdr + sent, hlen - sent);
+    if (n == 0) return false;
+    sent += n;
+  }
+  sent = 0;
+  while (sent < blen) {
+    size_t n = Serial.write(body + sent, blen - sent);
+    if (n == 0) return false;
+    sent += n;
+  }
+  return true;
+}
+
 void StereoCameras::Channel::emit() {
   uint8_t h[7] = { 0xAA, 0x55, id,
                    (uint8_t)len, (uint8_t)(len >> 8),
                    (uint8_t)(len >> 16), (uint8_t)(len >> 24) };
-  Serial.write(h, 7);
-  Serial.write(buf, len);
-  frames++;
+  if (writeWhole(h, 7, buf, len)) frames++;
+  else                            skipped++;   // host too slow; frame dropped
 }
 
 // ---------------- StereoCameras ----------------
 
 bool StereoCameras::begin(int leftRx, int leftTx, int rightRx, int rightTx) {
+  // The USB TX buffer must hold an ENTIRE frame, because writeWhole() only
+  // sends a frame when it fits (never partially). Default is a few hundred
+  // bytes — far too small, which would skip every frame.
+  Serial.setTxBufferSize(TX_BUFFER_BYTES);
+
   bool okL = left_.begin(&Serial1, leftRx, leftTx, 0);    // id 0 = LEFT
   bool okR = right_.begin(&Serial2, rightRx, rightTx, 1); // id 1 = RIGHT
   return okL && okR;
@@ -111,6 +163,5 @@ void StereoCameras::sendTelemetryFrame(const char* json) {
   uint8_t h[7] = { 0xAA, 0x55, 2,
                    (uint8_t)n, (uint8_t)(n >> 8),
                    (uint8_t)(n >> 16), (uint8_t)(n >> 24) };
-  Serial.write(h, 7);
-  Serial.write((const uint8_t*)json, n);
+  writeWhole(h, 7, (const uint8_t*)json, n);   // skipped if it won't fit
 }
