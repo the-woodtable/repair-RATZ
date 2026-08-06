@@ -162,13 +162,42 @@ def main():
         print("No serial port found.")
         return
     print(f"Capturing {SECONDS}s from {port} at {BAUD} baud...")
-    ser = serial.Serial(port, BAUD, timeout=0.1)
+    try:
+        ser = serial.Serial(port, BAUD, timeout=0.1)
+    except serial.SerialException as e:
+        print(f"Could not open {port}: {e}")
+        print("If it says 'Resource busy', another program has the port —")
+        print("close the control panel / Arduino Serial Monitor / pio monitor.")
+        return
+
     data = bytearray()
     t0 = time.time()
+    died = None
     while time.time() - t0 < SECONDS:
-        data.extend(ser.read(8192))
-    ser.close()
+        # A disconnect mid-capture shouldn't throw away everything we already
+        # collected — that data is exactly what tells us WHY it disconnected.
+        try:
+            data.extend(ser.read(8192))
+        except serial.SerialException as e:
+            died = (time.time() - t0, e)
+            break
+    try:
+        ser.close()
+    except serial.SerialException:
+        pass
     data = bytes(data)
+
+    if died:
+        secs, err = died
+        print(f"\n!! PORT DIED after {secs:.1f}s of {SECONDS}s")
+        print(f"   {err}")
+        print("   Most likely, in order:")
+        print("     1. another program has the port open (control panel still")
+        print("        running? pio device monitor? Arduino Serial Monitor?)")
+        print("     2. the S3 reset or browned out — check power, especially")
+        print("        if motors/actuator are now sharing the supply")
+        print("     3. USB cable/connector intermittent")
+        print("   Analysing what did arrive before it died:\n")
 
     gaps = []
     frames, corrupt = parse_frames(data, gaps)
@@ -176,15 +205,16 @@ def main():
 
     print()
     print("================ TRANSPORT ================")
-    print(f"bytes captured : {len(data)}  ({len(data)/SECONDS:.0f} B/s, "
-          f"{100*len(data)*10/(SECONDS*BAUD):.0f}% of {BAUD} baud)")
+    elapsed = died[0] if died else SECONDS
+    print(f"bytes captured : {len(data)}  ({len(data)/max(elapsed,0.1):.0f} B/s, "
+          f"{100*len(data)*10/(max(elapsed,0.1)*BAUD):.0f}% of {BAUD} baud)")
     if total == 0:
         print("NO frames found. Wrong baud for this source? (S3 via USB: any "
               "baud OK; camera direct: must match its Serial.begin)")
         return
     print(f"frames         : {len(frames)} good, {corrupt} corrupt "
           f"({100*corrupt/total:.1f}% corrupt)")
-    print(f"fps (good)     : {len(frames)/SECONDS:.1f}")
+    print(f"fps (good)     : {len(frames)/max(elapsed,0.1):.1f}")
     sizes = [len(j) for _, j in frames]
     if sizes:
         print(f"frame size     : avg {statistics.mean(sizes)/1000:.1f} KB   "

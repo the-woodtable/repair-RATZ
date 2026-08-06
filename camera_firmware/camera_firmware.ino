@@ -86,8 +86,30 @@ static const uint8_t MAGIC[2] = { 0xAA, 0x55 };
 //   too dark  -> raise FIXED_EXPOSURE first, then FIXED_GAIN
 //   too noisy -> lower FIXED_GAIN (gain amplifies noise; exposure doesn't)
 //   motion blur in a moving robot -> lower exposure, raise gain
-#define FIXED_EXPOSURE 600    // 0-1200
-#define FIXED_GAIN     8      // 0-30
+//
+// EXPOSURE ALSO CONTROLS FRAME RATE — this is not obvious and it cost us a
+// debugging session. aec_value is an integration time in sensor rows. Once
+// it exceeds the frame period the OV5640 stretches its vertical blanking to
+// make room, so the sensor itself produces fewer frames per second. At 600
+// we measured 14.4 fps total and a badly overexposed image (mean 184/216,
+// near clipping); the brighter image also compressed worse (3378 B/frame vs
+// 2841), and the extra bytes pushed the UART link into occasional truncated
+// frames. Dropping the exposure fixed the rate, the exposure and the
+// truncations together. If you raise this, expect fps to fall.
+#define FIXED_EXPOSURE 200    // 0-1200  (was 600: overexposed + halved fps)
+#define FIXED_GAIN     4      // 0-30    (was 8: gain amplifies channel imbalance)
+
+// Fixed white balance preset. 0 auto, 1 sunny, 2 cloudy, 3 office, 4 home.
+// Must be the same on both cameras (it is — one file, both flashes).
+#define WB_MODE 3
+
+// --- ORIENTATION ---
+// These give 180 degree rotation and mirroring ONLY. A sensor cannot rotate
+// 90 degrees (that needs rows and columns transposed, which the hardware
+// doesn't do) — for a 90 degree mount, set ROTATE_DEG in the PANEL instead,
+// or better, rotate the physical mount.
+#define FLIP_VERTICAL     0   // 0 or 1
+#define MIRROR_HORIZONTAL 0   // 0 or 1
 
 // camera_config_t is moved to file scope (was local to setup() originally)
 // so that loop() can reuse the exact same config to re-init the sensor
@@ -222,12 +244,22 @@ void applyFixedImageSettings() {
   sensor_t *s = esp_camera_sensor_get();
   if (!s) return;
 
-  // --- auto everything OFF ---
-  s->set_whitebal(s, 0);      // auto white balance off
-  s->set_awb_gain(s, 0);      // auto white balance gain off
+  // --- auto exposure/gain OFF (these must be identical on both cameras) ---
   s->set_exposure_ctrl(s, 0); // auto exposure off
   s->set_aec2(s, 0);          // "night mode" / extended AEC off
   s->set_gain_ctrl(s, 0);     // auto gain off
+
+  // --- white balance: FIXED PRESET, not "off" ---
+  // Turning white balance off entirely leaves the raw sensor channel gains
+  // uncorrected, which gives a heavy yellow/green cast. What we actually
+  // want is correction that is IDENTICAL on both cameras and never adapts:
+  // enable white balance, disable the auto-gain part, and pin a preset.
+  //   WB_MODE: 0 auto, 1 sunny, 2 cloudy, 3 office(fluorescent), 4 home(warm)
+  // Indoors under fluorescent/LED, 3 is usually closest. Try 2 or 4 if the
+  // cast is still off — but change it on BOTH cameras.
+  s->set_whitebal(s, 1);
+  s->set_awb_gain(s, 0);      // don't let it drift per-camera
+  s->set_wb_mode(s, WB_MODE);
 
   // --- fixed values (TUNE THESE, then reflash BOTH cameras) ---
   s->set_aec_value(s, FIXED_EXPOSURE);  // 0-1200, higher = brighter
@@ -240,8 +272,8 @@ void applyFixedImageSettings() {
   s->set_bpc(s, 1);           // bad pixel correction
   s->set_wpc(s, 1);           // white pixel correction
   s->set_lenc(s, 1);          // lens shading correction
-  s->set_hmirror(s, 0);
-  s->set_vflip(s, 0);
+  s->set_hmirror(s, MIRROR_HORIZONTAL);
+  s->set_vflip(s, FLIP_VERTICAL);
 }
 
 void loop() {

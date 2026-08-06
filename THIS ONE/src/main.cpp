@@ -117,6 +117,9 @@ void sendTelemetry() {
   Serial.print("{\"slip\":");
   Serial.print(imu.isSlipping());
 
+  Serial.print("{\"led\":");
+  Serial.print(led.isOn() ? led.brightness() : 0);
+
   Serial.println("}");
 }
 
@@ -155,9 +158,14 @@ void loop() {
       case 'L': led.on();  break;
       case 'O': led.off(); break;
 
-
       default:
-        break;   // ignore unrecognized characters
+        // Digits set lamp brightness: '0' = off ... '9' = full.
+        // Single characters keep the protocol as-is — no length-prefixed
+        // parameter parsing needed, and it stays typeable by hand.
+        if (c >= '0' && c <= '9') {
+          led.setBrightness((uint8_t)((c - '0') * 255 / 9));
+        }
+        break;   // ignore anything else
     }
   }
 

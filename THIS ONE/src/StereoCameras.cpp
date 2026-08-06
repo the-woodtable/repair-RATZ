@@ -1,6 +1,23 @@
 // src/StereoCameras.cpp
 #include "StereoCameras.h"
 
+// ===================== FAULT-ISOLATION TOGGLES =====================
+// For chasing a fault that stays on ONE side after the camera module, the
+// ribbon and the modules themselves have all been swapped. Flip ONE at a
+// time, reflash the S3 only, and compare diagnostic reports.
+//
+//   SWAP_UARTS       same pins, opposite UART peripheral
+//                      fault moves -> UART peripheral / driver
+//                      fault stays -> the pin, wire, or camera power
+//   PUMP_RIGHT_FIRST reverses servicing order
+//                      fault moves -> CPU starvation, not the channel
+//                      fault stays -> genuinely channel-specific
+//
+// Leave BOTH at 0 for normal operation.
+#define SWAP_UARTS       0
+#define PUMP_RIGHT_FIRST 0
+// ===================================================================
+
 static const uint32_t CAM_MAX_FRAME = 60000;
 static const uint32_t CAM_MIN_FRAME = 512;   // smaller than any real frame
 
@@ -126,14 +143,31 @@ bool StereoCameras::begin(int leftRx, int leftTx, int rightRx, int rightTx) {
   // bytes — far too small, which would skip every frame.
   Serial.setTxBufferSize(TX_BUFFER_BYTES);
 
+#if SWAP_UARTS
+  // Same PINS, opposite UART peripherals. If a fault that is stuck on one
+  // side moves when you flip this, the cause is the UART peripheral or its
+  // driver; if it stays put, the cause is the pin or what's wired to it.
+  bool okL = left_.begin(&Serial2, leftRx, leftTx, 0);
+  bool okR = right_.begin(&Serial1, rightRx, rightTx, 1);
+#else
   bool okL = left_.begin(&Serial1, leftRx, leftTx, 0);    // id 0 = LEFT
   bool okR = right_.begin(&Serial2, rightRx, rightTx, 1); // id 1 = RIGHT
+#endif
   return okL && okR;
 }
 
 void StereoCameras::update() {
+  // Servicing order matters under load: whichever channel is pumped second
+  // has had longer to accumulate bytes, so it overflows first if the CPU is
+  // the bottleneck. Flip PUMP_RIGHT_FIRST to see whether the fault follows
+  // the ORDER (a starvation/CPU problem) rather than the channel.
+#if PUMP_RIGHT_FIRST
+  right_.pump();
+  left_.pump();
+#else
   left_.pump();
   right_.pump();
+#endif
 }
 
 bool StereoCameras::handleChar(char c) {
