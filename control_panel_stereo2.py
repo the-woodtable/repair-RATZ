@@ -476,11 +476,17 @@ class App:
         # Crack/hole detector — runs on the LEFT view each tick. Loaded
         # once here (model load is slow); update() itself is fast enough
         # to call every frame.
-        self.cv_tracker = None
+        self.cv_tracker_l = None
+        self.cv_tracker_r = None
         self.cv_error = None
         if os.path.exists(CV_MODEL_PATH):
             try:
-                self.cv_tracker = CrackTracker(CV_MODEL_PATH, conf_threshold=CV_CONF)
+                # Separate tracker instances per camera -- each camera's
+                # track IDs are their own independent identity space, so
+                # sharing one instance would mix up left/right detections
+                # under the same ID numbers.
+                self.cv_tracker_l = CrackTracker(CV_MODEL_PATH, conf_threshold=CV_CONF)
+                self.cv_tracker_r = CrackTracker(CV_MODEL_PATH, conf_threshold=CV_CONF)
             except Exception as e:
                 self.cv_error = str(e)
         else:
@@ -545,6 +551,17 @@ class App:
         cvf = tk.LabelFrame(body, text="Crack/Hole Detections",
                             bg="#1e1e1e", fg="#ccc")
         cvf.pack(fill="x", padx=8, pady=4)
+
+        conf_row = tk.Frame(cvf, bg="#1e1e1e")
+        conf_row.pack(fill="x", padx=6, pady=(4, 0))
+        tk.Label(conf_row, text="conf", bg="#1e1e1e", fg="#ccc").pack(side="left")
+        self.cv_conf_scale = tk.Scale(
+            conf_row, from_=0.05, to=0.95, resolution=0.05, orient="horizontal",
+            bg="#1e1e1e", fg="#ccc", highlightthickness=0, troughcolor="#333",
+            length=220, command=self._on_conf_scale)
+        self.cv_conf_scale.set(CV_CONF)
+        self.cv_conf_scale.pack(side="left", padx=6)
+
         self.lbl_cv = tk.Label(cvf, text="", bg="#1e1e1e", fg="#f66",
                                font=("Menlo", 11), justify="left", anchor="w")
         self.lbl_cv.pack(fill="x", padx=6, pady=4)
@@ -738,6 +755,13 @@ class App:
             self._led_last = v
             self.link.send(str(v))
 
+    def _on_conf_scale(self, val):
+        v = float(val)
+        if self.cv_tracker_l is not None:
+            self.cv_tracker_l.conf_threshold = v
+        if self.cv_tracker_r is not None:
+            self.cv_tracker_r.conf_threshold = v
+
     def stop_all(self):
         """Panic button: stop drive AND actuator."""
         self.link.send("S")
@@ -845,16 +869,49 @@ class App:
         print(f"\n  -> {verdict}")
         print("=" * 58 + "\n")
 
+    def _draw_detections(self, img, detections, disp, cv_lines, tag):
+        """Draws confirmed detections onto img in place, and appends their
+        text summary (with tag "L"/"R" so the panel shows which camera each
+        came from) into cv_lines."""
+        for det in detections:
+            pts = det.mask_xy
+            cv2.polylines(img, [pts], isClosed=True, color=(0, 0, 255),
+                         thickness=2)
+            cx, cy = int(det.centroid[0]), int(det.centroid[1])
+            dist_txt = "--"
+            if disp is not None:
+                dm = self.calib.distance_mm(disp, cx, cy)
+                if dm:
+                    dist_txt = f"{dm / 10:.1f} cm"
+            label_txt = f"{tag} ID{det.track_id} {det.label} {det.conf:.2f}"
+            (tw_, th_), _ = cv2.getTextSize(label_txt,
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            x1, y1 = pts[:, 0].min(), pts[:, 1].min()
+            cv2.rectangle(img, (x1, y1 - th_ - 6), (x1 + tw_ + 4, y1),
+                         (0, 0, 0), -1)
+            cv2.putText(img, label_txt, (x1 + 2, y1 - 4),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1,
+                       cv2.LINE_AA)
+            cv_lines.append(f"{tag} ID{det.track_id}  {det.label:<6}"
+                           f"  conf {det.conf:.2f}  dist {dist_txt}")
+
     # ---- main loop ----
     def _tick(self):
         img_l, img_r, disp = self.worker.snapshot()
 
-        detections = []
-        if img_l is not None and self.cv_tracker is not None:
+        det_l, det_r = [], []
+        if img_l is not None and self.cv_tracker_l is not None:
             try:
-                detections = self.cv_tracker.update(img_l)
+                det_l = self.cv_tracker_l.update(img_l)
             except Exception as e:
-                self.lbl_cv.config(text=f"CV error: {e}", fg="#f55")
+                self.lbl_cv.config(text=f"CV error (L): {e}", fg="#f55")
+        if img_r is not None and self.cv_tracker_r is not None:
+            try:
+                det_r = self.cv_tracker_r.update(img_r)
+            except Exception as e:
+                self.lbl_cv.config(text=f"CV error (R): {e}", fg="#f55")
+
+        cv_lines = []
 
         if img_l is not None:
             h, w = img_l.shape[:2]
@@ -865,40 +922,21 @@ class App:
                     text=f"distance: {d / 10:.1f} cm" if d
                          else "distance: -- (no texture / too close)",
                     fg="#ff0" if d else "#e8a33d")
-            vis = img_l.copy()
-            cv2.drawMarker(vis, (tx, ty), (0, 255, 255), cv2.MARKER_CROSS, 15, 1)
+            vis_l = img_l.copy()
+            cv2.drawMarker(vis_l, (tx, ty), (0, 255, 255), cv2.MARKER_CROSS, 15, 1)
+            self._draw_detections(vis_l, det_l, disp, cv_lines, "L")
+            self._show(self.lblL, vis_l)
 
-            cv_lines = []
-            for det in detections:
-                pts = det.mask_xy
-                cv2.polylines(vis, [pts], isClosed=True, color=(0, 0, 255),
-                             thickness=2)
-                cx, cy = int(det.centroid[0]), int(det.centroid[1])
-                dist_txt = "--"
-                if disp is not None:
-                    dm = self.calib.distance_mm(disp, cx, cy)
-                    if dm:
-                        dist_txt = f"{dm / 10:.1f} cm"
-                label_txt = f"ID{det.track_id} {det.label} {det.conf:.2f}"
-                (tw_, th_), _ = cv2.getTextSize(label_txt,
-                                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                x1, y1 = pts[:, 0].min(), pts[:, 1].min()
-                cv2.rectangle(vis, (x1, y1 - th_ - 6), (x1 + tw_ + 4, y1),
-                             (0, 0, 0), -1)
-                cv2.putText(vis, label_txt, (x1 + 2, y1 - 4),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1,
-                           cv2.LINE_AA)
-                cv_lines.append(f"ID{det.track_id}  {det.label:<6}"
-                               f"  conf {det.conf:.2f}  dist {dist_txt}")
-
-            if self.cv_tracker is not None and not self.cv_error:
-                self.lbl_cv.config(
-                    text="\n".join(cv_lines) if cv_lines else "no confirmed detections",
-                    fg="#f66")
-
-            self._show(self.lblL, vis)
         if img_r is not None:
-            self._show(self.lblR, img_r)
+            vis_r = img_r.copy()
+            self._draw_detections(vis_r, det_r, disp, cv_lines, "R")
+            self._show(self.lblR, vis_r)
+
+        if (self.cv_tracker_l is not None or self.cv_tracker_r is not None) \
+                and not self.cv_error:
+            self.lbl_cv.config(
+                text="\n".join(cv_lines) if cv_lines else "no confirmed detections",
+                fg="#f66")
 
         # fps + health line
         now = time.time()
