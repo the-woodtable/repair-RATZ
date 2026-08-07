@@ -38,6 +38,8 @@ import serial
 import serial.tools.list_ports
 from PIL import Image, ImageTk
 
+from crack_tracker import CrackTracker
+
 # ============================ CONFIG ============================
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -65,6 +67,10 @@ MAX_FLAT_BOTTOM = 0.05
 # corrupted everything below it (shows up as a sudden purple/green band).
 # Raise if legitimate scenes are being rejected; lower to be stricter.
 MAX_COLOUR_JUMP = 45.0
+
+# Crack/hole detection model. Set to your trained weights path.
+CV_MODEL_PATH = os.path.join(HERE, "CV.pt")
+CV_CONF = 0.4
 
 # Rotation applied to each camera on arrival: 0, 90, 180 or 270 clockwise.
 # PER CAMERA, because the two are not necessarily mounted the same way —
@@ -467,6 +473,19 @@ class App:
         self.worker = DepthWorker(link, calib)
         self.worker.start()
 
+        # Crack/hole detector — runs on the LEFT view each tick. Loaded
+        # once here (model load is slow); update() itself is fast enough
+        # to call every frame.
+        self.cv_tracker = None
+        self.cv_error = None
+        if os.path.exists(CV_MODEL_PATH):
+            try:
+                self.cv_tracker = CrackTracker(CV_MODEL_PATH, conf_threshold=CV_CONF)
+            except Exception as e:
+                self.cv_error = str(e)
+        else:
+            self.cv_error = f"model not found: {CV_MODEL_PATH}"
+
         root.title("EDI PIPE CAM — camera panel (capture + calibration)")
         root.configure(bg="#1e1e1e")
 
@@ -521,6 +540,16 @@ class App:
         self.lbl_dist.pack()
         self.lbl_status = tk.Label(body, text="", bg="#1e1e1e", fg="#0f0")
         self.lbl_status.pack()
+
+        # ---- crack/hole detections ----
+        cvf = tk.LabelFrame(body, text="Crack/Hole Detections",
+                            bg="#1e1e1e", fg="#ccc")
+        cvf.pack(fill="x", padx=8, pady=4)
+        self.lbl_cv = tk.Label(cvf, text="", bg="#1e1e1e", fg="#f66",
+                               font=("Menlo", 11), justify="left", anchor="w")
+        self.lbl_cv.pack(fill="x", padx=6, pady=4)
+        if self.cv_error:
+            self.lbl_cv.config(text=f"CV disabled: {self.cv_error}", fg="#e8a33d")
 
         # ---- robot controls ----
         # These send the same single characters main.cpp listens for. They
@@ -820,6 +849,13 @@ class App:
     def _tick(self):
         img_l, img_r, disp = self.worker.snapshot()
 
+        detections = []
+        if img_l is not None and self.cv_tracker is not None:
+            try:
+                detections = self.cv_tracker.update(img_l)
+            except Exception as e:
+                self.lbl_cv.config(text=f"CV error: {e}", fg="#f55")
+
         if img_l is not None:
             h, w = img_l.shape[:2]
             tx, ty = self.target if self.target else (w // 2, h // 2)
@@ -831,6 +867,35 @@ class App:
                     fg="#ff0" if d else "#e8a33d")
             vis = img_l.copy()
             cv2.drawMarker(vis, (tx, ty), (0, 255, 255), cv2.MARKER_CROSS, 15, 1)
+
+            cv_lines = []
+            for det in detections:
+                pts = det.mask_xy
+                cv2.polylines(vis, [pts], isClosed=True, color=(0, 0, 255),
+                             thickness=2)
+                cx, cy = int(det.centroid[0]), int(det.centroid[1])
+                dist_txt = "--"
+                if disp is not None:
+                    dm = self.calib.distance_mm(disp, cx, cy)
+                    if dm:
+                        dist_txt = f"{dm / 10:.1f} cm"
+                label_txt = f"ID{det.track_id} {det.label} {det.conf:.2f}"
+                (tw_, th_), _ = cv2.getTextSize(label_txt,
+                                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                x1, y1 = pts[:, 0].min(), pts[:, 1].min()
+                cv2.rectangle(vis, (x1, y1 - th_ - 6), (x1 + tw_ + 4, y1),
+                             (0, 0, 0), -1)
+                cv2.putText(vis, label_txt, (x1 + 2, y1 - 4),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1,
+                           cv2.LINE_AA)
+                cv_lines.append(f"ID{det.track_id}  {det.label:<6}"
+                               f"  conf {det.conf:.2f}  dist {dist_txt}")
+
+            if self.cv_tracker is not None and not self.cv_error:
+                self.lbl_cv.config(
+                    text="\n".join(cv_lines) if cv_lines else "no confirmed detections",
+                    fg="#f66")
+
             self._show(self.lblL, vis)
         if img_r is not None:
             self._show(self.lblR, img_r)
