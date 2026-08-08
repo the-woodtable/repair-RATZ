@@ -401,8 +401,27 @@ class StereoCalib:
             self.map2x, self.map2y = d["map2x"], d["map2y"]
             self.fx = float(d["fx"])
             self.baseline = float(d["baseline"])       # mm
+            # numDisparities sets how far SGBM searches sideways for a match,
+            # and therefore the CLOSEST distance measurable:
+            #     nearest_mm = fx * baseline / numDisparities
+            # With fx 385 px and a 125 mm baseline: 64 -> 75 cm, 128 -> 38 cm.
+            # Too low and near objects are not merely missed — SGBM settles on
+            # a small wrong disparity and reports a confidently wrong LARGE
+            # distance (a board 50 cm away read as 514 cm).
+            # Must be a multiple of 16. Raising it costs proportional CPU.
+            #
+            # HARD CEILING: SGBM cannot match the leftmost `numDisparities`
+            # columns — there is nothing to their left in the other image to
+            # search against. Our frames are 240 px wide in the disparity
+            # direction, so 128 blanked out the left 128 px INCLUDING the
+            # centre crosshair at x=120, and the distance readout died
+            # completely. Keep this below ~40% of frame width.
+            #     96 -> left 96 px dead, centre fine, nearest 50 cm
+            # If you need to measure closer, move the CAMERAS closer together
+            # (nearest scales with baseline) — that costs nothing and does not
+            # eat the image.
             self.sgbm = cv2.StereoSGBM_create(
-                minDisparity=0, numDisparities=64, blockSize=7,
+                minDisparity=0, numDisparities=96, blockSize=7,
                 P1=8 * 49, P2=32 * 49, uniquenessRatio=10,
                 speckleWindowSize=100, speckleRange=2, disp12MaxDiff=1)
             self.ok = True

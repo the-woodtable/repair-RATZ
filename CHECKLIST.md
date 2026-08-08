@@ -272,3 +272,47 @@ Everything the panel and tools capture lands under one folder:
 If you ever want to move it, change `DATA_DIR` at the top of
 `control_panel_stereo2.py`, `stream_quality.py` and `extract_frames.py` —
 all other paths are derived from it.
+
+---
+
+## Stereo calibration — deferred to final assembly
+
+Calibration describes exactly where the cameras are. Moving one voids it,
+and the failure is SILENT: you get plausible-looking distances that are
+simply wrong. So this is the last step, after the cameras are rigidly
+mounted and will not move again.
+
+### Already settled (don't re-derive)
+
+| Setting | Value | Where |
+|---|---|---|
+| Board | 11x8 squares = **(10, 7)** inner corners | `stereo_calibrate.py` |
+| Square size | **19.5 mm** (measured with a ruler) | `stereo_calibrate.py` |
+| Rotation | `ROTATE_DEG = (270, 90)` | must match in panel AND calibrator |
+
+First attempt used 15.0 mm and produced a 95.9 mm baseline for a rig whose
+lenses are 125 mm apart — wrong by exactly 19.5/15.0. The printed baseline
+vs a ruler is the self-check; use it every time.
+
+### Known constraints at final assembly
+
+Frames are 240 px wide in the disparity direction (the 90-degree rotation
+puts the short axis there), and:
+
+    nearest measurable = fx * baseline / numDisparities
+
+* `numDisparities` cannot exceed ~40% of frame width. SGBM cannot match the
+  leftmost `numDisparities` columns, and at 128 the dead zone swallowed the
+  centre crosshair and the readout died entirely. **96 is the practical max.**
+* With the current 125 mm lens gap: nearest = 50 cm. Below 20 cm the two
+  fields of view do not intersect at all.
+
+### Three ways to measure closer, in order of cost
+
+1. **Narrow the baseline** — free, no CPU, no lost pixels. 60 mm gap -> 24 cm.
+2. **`alpha` in `stereoRectify`** — currently `alpha=0`, which crops the frame
+   to fully-valid pixels only and throws away real FOV given the 4 mm vertical
+   and 7 mm depth offset between cameras. Try `alpha=0.5`; costs black borders.
+3. **Wider lens** — 60 deg would roughly halve the near limit. Do NOT go to
+   90 deg+ without more resolution: a 1 mm crack at 30 cm is 1.27 px today and
+   0.40 px at 90 deg, i.e. undetectable. Ranging would improve, detection would die.

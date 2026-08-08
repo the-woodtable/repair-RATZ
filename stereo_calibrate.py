@@ -29,8 +29,21 @@ from stereo_serial import TaggedFrameReader
 # ------------------- Settings -------------------
 PORT = None               # None = auto-detect; or set e.g. "/dev/cu.usbmodem101"
 BAUD = 921600
-BOARD = (9, 6)            # inner corners (cols, rows)
-SQUARE_MM = 25.0          # printed square size in mm — MEASURE IT
+# INNER corners, not squares: an 11x8 square board has 10x7 inner corners
+# (the crossings where four squares meet — the outer edges don't count).
+# Get this wrong and findChessboardCorners simply never matches, with no
+# error message; you just press SPACE forever and nothing is captured.
+BOARD = (10, 7)           # inner corners (cols, rows) — 11x8 square board
+
+# SETS THE SCALE OF EVERY DISTANCE YOU WILL EVER MEASURE. Measure a printed
+# square with a ruler; don't trust what the PDF claimed, printers rescale.
+# If this is wrong by 10%, every reported distance is wrong by 10%.
+# Self-check: the baseline this script prints must match a ruler measurement
+# of the gap between your two lenses. If it doesn't, this number is why.
+# 19.5 measured with a ruler on the actual printout. The first run used 15.0
+# and produced a 95.9 mm baseline for a rig whose lenses are 125 mm apart —
+# wrong by exactly 19.5/15.0. That is the self-check working.
+SQUARE_MM = 19.5          # printed square size in mm — MEASURE IT
 OUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "stereo_calib.npz")
 
@@ -80,7 +93,10 @@ def main():
     obj_pts, pts_l, pts_r = [], [], []
     img_size = None
     last_l = last_r = None
+    waiting_since = time.time()
     print("SPACE=capture pair, c=calibrate+save, q=quit")
+    print("(the preview window only appears once BOTH cameras have sent a "
+          "frame)")
 
     while True:
         jl, jr = reader.latest(b"L"), reader.latest(b"R")
@@ -89,6 +105,20 @@ def main():
         if jr is not None:
             last_r = decode(jr, 1)
         if last_l is None or last_r is None:
+            # Say WHICH camera we're waiting on. Previously this loop was
+            # silent, so a dead channel looked identical to a script that
+            # had hung — no window, no message, nothing to act on.
+            now = time.time()
+            if now - waiting_since > 2.0:
+                missing = []
+                if last_l is None:
+                    missing.append("LEFT")
+                if last_r is None:
+                    missing.append("RIGHT")
+                print(f"waiting for {' and '.join(missing)} "
+                      f"— no frames yet. Is the S3 running? "
+                      f"Is the panel still open holding the port?")
+                waiting_since = now
             time.sleep(0.02)
             continue
 
