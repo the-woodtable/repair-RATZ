@@ -4,7 +4,7 @@
 class HookServo {
 public:
 
-  bool begin(int pin);  
+  bool begin(int pin, int initial_angle);  
   void setAngle(int angle);
   int getCurrentAngle();
 

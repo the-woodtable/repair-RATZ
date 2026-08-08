@@ -1,7 +1,7 @@
 // src/HookServo.cpp
 #include "HookServo.h"
 
-bool HookServo::begin(int pin) {
+bool HookServo::begin(int pin, int initial_angle) {
   pin_ = pin;
 
   servo_.setPeriodHertz(50);
@@ -11,7 +11,7 @@ bool HookServo::begin(int pin) {
     return false;   // attach failed — pin invalid or no free PWM channel
   }
 
-  setAngle(180);
+  setAngle(initial_angle);
   return true;
 }
 void HookServo::setAngle(int angle){

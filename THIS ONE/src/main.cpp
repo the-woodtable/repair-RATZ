@@ -8,6 +8,7 @@
 
 //PINS
 int PIN_SERVO = 11;
+int PIN_SPOOL = 15;
 int PIN_STEP =  4;
 int PIN_DIR = 5;
 int PIN_EN =  6;
@@ -27,6 +28,7 @@ int PIN_LED = 12;
 
 //OBJECTS FROM CLASSES
 HookServo hookServo;
+HookServo spoolServo;
 Stepper stepper;
 Actuator actuator;
 StereoCameras cameras; 
@@ -34,7 +36,7 @@ IMU imu;
 LED led;
 
 //STEPPER VARIABLES
-int STEP_HZ = 800;
+int STEP_HZ = 200;
 
  
 //ACTUATOR VARIABLES
@@ -52,8 +54,13 @@ uint32_t lastTelemetry = 0;
 void setup() {
   Serial.begin(460800);
 
-  if (!hookServo.begin(PIN_SERVO)) {
+  if (!hookServo.begin(PIN_SERVO, 180)) {
     Serial.println("ERROR: hook servo failed to attach!");
+    setupSuccessful = false;
+  }
+
+  if (!spoolServo.begin(PIN_SPOOL, 90)) {
+    Serial.println("ERROR: spool servo failed to attach!");
     setupSuccessful = false;
   }
 
@@ -136,10 +143,14 @@ void loop() {
 
     switch (c) {
 
-      //servo
+      //-- servo --
       case 'H': hookServo.setAngle(180); break;
       case 'U': hookServo.setAngle(0); break;
       case 'A': hookServo.setAngle(90); break;
+
+      // -- spool --
+      case 'T': spoolServo.setAngle(180); break;
+      case 'Y': spoolServo.setAngle(90); break;
 
       // -- stepper--
       case 'F': stepper.setDrive(+1); break;
