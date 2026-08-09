@@ -7,12 +7,18 @@ alternative front end. Keep the old panel for diagnostics and recording; use
 this one when people are watching.
 
     pip3 install PySide6
-    pip3 install pyserial          # optional - runs in SIM mode without it
+    pip3 install pyserial                  # else SIM mode only
+    pip3 install opencv-python ultralytics # else no crack overlays / distance
 
     python3 rat88_panel.py                       # auto-detect port
     python3 rat88_panel.py --sim                 # no hardware, animated feed
-    python3 rat88_panel.py --port /dev/cu.usbserial-XXXX
+    python3 rat88_panel.py --port /dev/cu.usbmodemXXXX
+    python3 rat88_panel.py --no-cv               # skip YOLO+SGBM if it's slow
+    python3 rat88_panel.py --conf 0.55           # detection threshold
     python3 rat88_panel.py --list                # show ports and exit
+
+Crack detection runs on the LEFT camera only and distance comes from the
+stereo disparity map, so the right pane stays cheap. See showcase_cv.py.
 
 Wire format in  (from stereo_serial.py / main.cpp):
     0xAA 0x55 | ID(1) | uint32 LE length | payload
@@ -22,31 +28,39 @@ Wire format in  (from stereo_serial.py / main.cpp):
 
 Wire format out (single characters, no terminator - what main.cpp listens for):
     F/B/S      drive forward / back / stop
-    D/R/X      actuator deploy / retract / stop
-    H/U        hook / release
-    A          assembly
+    D/R/X      lining actuator deploy / retract / stop
+    H/A/U      hook servo    180 / 90 / 0
+    T/Y        spool servo   180 / 90
     L/O        LED on / off
     Z          zero odometry
     '0'-'9'    lamp brightness, mapped to 0-255 in firmware
 
-NOTE: the current firmware has NO dead-man watchdog. A motor runs until it is
-told to stop, so every press-and-hold control sends its stop character on
-release, on mouse-leave, and on window deactivate.
+Three different kinds of hardware, so three different kinds of control:
+    DRIVE     Stepper::setDrive has NO timeout. It runs until told 'S', so the
+              arrows are press-and-hold and send 'S' on release, on
+              mouse-leave, and when the window loses focus.
+    LINING    An actuator - a motor that runs. Actuator::update() cuts it
+              after MAX_RUN_MS (10s, THIS ONE/include/Actuator.h). One click
+              starts a move; the firmware ends it.
+    HOOK,     Servos. setAngle drives them to a position and holds. Nothing
+    SPOOL     to stop and no timer needed; one click parks them.
 """
 
 import argparse
 import math
+import os
 import queue
 import re
 import struct
 import sys
 import threading
 import time
+from pathlib import Path
 
-from PySide6.QtCore import (QObject, QPoint, QPointF, QRect, QSize, Qt, QTimer,
-                            Signal)
-from PySide6.QtGui import (QBrush, QColor, QFont, QIcon, QImage, QPainter,
-                           QPainterPath, QPen, QPixmap, QPolygonF)
+from PySide6.QtCore import (QBuffer, QObject, QPoint, QRect, QSize, Qt,
+                            QTimer, Signal)
+from PySide6.QtGui import (QColor, QFont, QIcon, QImage, QPainter,
+                           QPen, QPixmap)
 from PySide6.QtWidgets import (QApplication, QLabel, QPushButton, QSlider,
                                QWidget)
 
@@ -57,20 +71,73 @@ try:
 except ImportError:
     HAVE_SERIAL = False
 
+try:
+    import numpy as np
+    import cv2
+    import showcase_cv as scv
+    HAVE_CV = True
+    CV_IMPORT_ERROR = None
+except ImportError as _exc:          # panel still runs, just without overlays
+    HAVE_CV = False
+    CV_IMPORT_ERROR = str(_exc)
+
 
 # ---------------------------------------------------------------------------
-# ASSETS - point these at your exported artwork. None = generated placeholder.
+# ASSETS - every picture the panel draws.
+#
+# Paths are relative to THIS FILE, not to wherever you launched the terminal
+# from, so `python3 rat88_panel.py` works from any directory. PNG with
+# transparency is what you want; the alpha channel is what makes the
+# odd-shaped buttons click correctly. SVG also loads.
+#
+# All of these are required except the "_on" and "_down" variants, which are
+# the extra states: "_on" is the lit look for a button in a selection group,
+# "_down" is the held look for a press-and-hold button. Leave one None and the
+# panel generates that state by fading or tinting the base image. Missing
+# files are reported all at once at startup by check_assets().
 # ---------------------------------------------------------------------------
-
 ASSETS = {
-    "background":   None,   # e.g. "art/bg.png"   full 1280x960 plate
-    "arrow_up":     None,
-    "arrow_down":   None,
-    "cheese":       None,   # slider handle
-    "groove":       None,   # slider bar
-    "can":          None,   # DEPLOY LINING
-    "hook":         None,
+    "background":     "buttons/21background.png",       # plain 4:3 plate
+
+    # Decorations. Drawn behind every control, so they may overlap freely.
+    # The header art is the rat and its footprints only; the title text is
+    # still drawn by the panel on top of it.
+    "header":         "buttons/18ratz_header.png",
+    "mouse_top":      "buttons/20cheeze.png",           # top right, with heart
+    "mouse_bottom":   "buttons/19say_cheeze.png",       # bottom left, with camera
+
+    "bezel":          "buttons/17cam_background.png",   # frame round the video
+    "arrow_up":       "buttons/01fwd_unpressed.png",
+    "arrow_up_down":  "buttons/03fwd_pressed.png",      # shown while held
+    "arrow_down":     "buttons/02bwd_unpressed.png",
+    "arrow_down_down": "buttons/04bwd_pressed.png",
+    "cheese":         "buttons/06cheese_slider.png",    # slider handle
+    "groove":         "buttons/24slider_nosuns.png",    # vertical slider bar
+    "sun_max":        "buttons/22sun_max.png",          # big sun, top
+    "sun_min":        "buttons/23sun_min.png",          # small sun, bottom
+
+    # Lining pair. "_on" is the selected/lit artwork.
+    "can":            "buttons/07lining_compressed.png",
+    "can_on":         "buttons/08lining_deployed.png",
+    "spool":          "buttons/25sized_spool_extended.png",
+    "spool_on":       "buttons/26sized_spool_retracted.png",
+
+    # Hook positions, named the way you name them. HOOK_POSITIONS below says
+    # which servo command each one sends.
+    "pos_hook":         "buttons/12hook_upright_unpressed.png",
+    "pos_hook_on":      "buttons/11hook_upright_pressed.png",
+    "pos_assembly":     "buttons/14hook_side_unpressed.png",
+    "pos_assembly_on":  "buttons/13hook_side_pressed.png",
+    "pos_deploy":       "buttons/16hook_down_unpressed.png",
+    "pos_deploy_on":    "buttons/15hook_down_pressed.png",
 }
+
+HERE = Path(__file__).resolve().parent
+
+
+def asset_path(p: str) -> str:
+    q = Path(p)
+    return str(q if q.is_absolute() else HERE / q)
 
 # ---------------------------------------------------------------------------
 # Design constants - measured off the mockup, 1280x960 canvas
@@ -79,25 +146,94 @@ ASSETS = {
 CANVAS = QSize(1280, 960)
 
 GEO = {
-    "video_left":   QRect(90,  176, 376, 502),
-    "video_right":  QRect(473, 176, 376, 502),
-    "arrow_up":     QRect(966, 349, 122, 131),
-    "arrow_down":   QRect(966, 505, 122, 136),
-    "slider":       QRect(424, 744, 342,  78),
-    "can":          QRect(838, 729, 155, 120),
-    "hook":         QRect(1068, 722,  88, 133),
-    "title":        QRect(0,    50, 1280, 100),
-    "status":       QRect(0,   904, 1280,  50),
+    # Decorations, drawn behind every control.
+    "header":       QRect(268,  70,  750, 112),   # rat + footprints
+    "mouse_top":    QRect(1250,  0,  195, 179),
+    "mouse_bottom": QRect(-140,   840,  215, 154),
+
+    "title":        QRect(168,  38,  812, 104),   # text, drawn over "header"
+    "bezel":        QRect(168, 148,  812, 556),
+    "video_left":   QRect(192, 172,  376, 506),
+    "video_right":  QRect(576, 172,  380, 506),
+
+    # Vertical lamp slider: big sun (bright) on top, small sun at the bottom.
+    "sun_max":      QRect(68,  228,   48,  55),
+    "slider":       QRect(45,  288,  104, 300),
+    "sun_min":      QRect(74,  594,   37,  42),
+
+    # Boxes match each PNG's own aspect ratio, centred on the mockup position,
+    # so fit() has no slack to letterbox away.
+    "arrow_up":     QRect(1040, 385, 185, 207),
+    "arrow_down":   QRect(1036, 618, 192, 214),
+
+    # Lining group - mutually exclusive, one runs at a time.
+    "can":          QRect(208, 733,  162, 164),
+    "spool":        QRect(462, 736,  178, 169),
+
+    # Hook group - three servo positions, left to right. Keys match the names
+    # in HOOK_POSITIONS; swap these rects if you reorder that list.
+    "pos_hook":     QRect(676, 748,   60, 138),
+    "pos_assembly": QRect(744, 784,  134,  59),
+    "pos_deploy":   QRect(885, 750,   59, 134),
+
+    # "status":       QRect(0,   900, 1280,  48),
 }
+
+TITLE_TEXT = "repair rat #64"
+
+# ---------------------------------------------------------------------------
+# THE HOOK POSITIONS - single source of truth.
+#
+# Listed LEFT TO RIGHT as they appear on screen. Each entry is:
+#   (asset/GEO name, serial char, servo angle, label shown in the status bar)
+#
+# The angles come from src/main.cpp:
+#     case 'H': hookServo.setAngle(180)
+#     case 'A': hookServo.setAngle(90)
+#     case 'U': hookServo.setAngle(0)
+# and they line up with the artwork: upright at 180, side-on at 90, down at 0.
+#
+# To reorder the buttons on screen, reorder this list AND swap the matching
+# rects in GEO. To rename one, change it here and rename its two asset files.
+# ---------------------------------------------------------------------------
+HOOK_POSITIONS = [
+    ("pos_hook",     "H", 180, "hook"),
+    ("pos_assembly", "A",  90, "assembly"),
+    ("pos_deploy",   "U",   0, "deploy"),
+]
+
+HOOK_LABEL = {cmd: label for _, cmd, _, label in HOOK_POSITIONS}
+HOOK_ANGLE = {cmd: ang for _, cmd, ang, _ in HOOK_POSITIONS}
+
+# Where the servo actually sits at power-on. main.cpp line 57:
+#     hookServo.begin(PIN_SERVO, 180)   ->  180 is 'H'
+# Showing anything else would be a lie about the hardware before you have
+# touched a button.
+HOOK_BOOT = "H"
+
+# ---------------------------------------------------------------------------
+# THE TWO INDEPENDENT TOGGLES
+#
+# The can and the spool are separate mechanisms on separate hardware, so each
+# is its own two-state button rather than a pair that fight over one motor.
+#
+# LINING is the actuator (a motor). 'D' extends it, 'R' pulls it back, and
+# Actuator::update() cuts power after ACT_RUN_S either way.
+#
+# SPOOL is a servo of its own on PIN_SPOOL (main.cpp lines 152-153):
+#     case 'T': spoolServo.setAngle(180)
+#     case 'Y': spoolServo.setAngle(90)
+# and main.cpp line 62 starts it with spoolServo.begin(PIN_SPOOL, 90), so 90
+# ('Y') is the power-on position and therefore the "off" artwork.
+#
+# Each entry is (off command, on command, off label, on label, starts on).
+# ---------------------------------------------------------------------------
+LINING = ("R", "D", "compressed", "deployed", False)
+SPOOL = ("Y", "T", "string out", "wound in", False)
 
 C_BG        = QColor("#E4E2DD")
 C_INK       = QColor("#1B4EA0")
-C_BLUE      = QColor("#7BA3D8")
-C_RED       = QColor("#C1666B")
-C_PAW       = QColor("#CFCFCB")
-C_CHEESE    = QColor("#EDB94F")
-C_HOLE      = QColor("#E0913F")
-C_METAL     = QColor("#C9CDD2")
+C_BLUE      = QColor("#7BA3D8")   # video pane border
 
 # Protocol
 MAGIC = b"\xAA\x55"
@@ -107,136 +243,87 @@ TELEM_ID = 0x02
 MAX_FRAME = 200_000
 SOI, EOI = b"\xFF\xD8", b"\xFF\xD9"
 
-# Set True only if the hook physically fouls the wheels when deployed.
+# Set True only if the hook physically fouls the wheels while it is holding
+# the string loops. Blocks F/B whenever the hook is in the 'H' position.
 INTERLOCK_HOOK_BLOCKS_DRIVE = False
+
+# Must match Actuator::MAX_RUN_MS in "THIS ONE/include/Actuator.h" (10000 ms).
+# The firmware is what actually stops the motor; this is only for the on-screen
+# countdown. If you change one, change the other.
+ACT_RUN_S = 10.0
 
 _TELEM_RE = re.compile(r'"?(\w+)"?\s*[:=]\s*(-?\d+(?:\.\d+)?)')
 
 
+
 # ---------------------------------------------------------------------------
-# Placeholder art
+# Artwork loading
 # ---------------------------------------------------------------------------
 
-def _blank(size: QSize) -> QPixmap:
-    pm = QPixmap(size)
-    pm.fill(Qt.transparent)
-    return pm
+# Everything else in ASSETS is required. These are the extra states: without
+# them a button still works, it just falls back to a generated tint/fade.
+OPTIONAL_ASSETS = {k for k in ASSETS if k.endswith(("_on", "_down"))}
 
 
-def _painter(pm: QPixmap) -> QPainter:
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.Antialiasing, True)
-    p.setPen(Qt.NoPen)
-    return p
+def check_assets():
+    """Report every missing file at once, before the window is built.
+
+    There are no drawn placeholders any more, so a typo used to mean a blank
+    button with a line buried in the console. Fail loudly and list all of them
+    together instead of one per run.
+    """
+    problems = []
+    for key, path in ASSETS.items():
+        if not path:
+            if key not in OPTIONAL_ASSETS:
+                problems.append(f"  {key:18s} not set in ASSETS")
+            continue
+        full = asset_path(path)
+        if not os.path.exists(full):
+            problems.append(f"  {key:18s} file not found: {path}")
+    return problems
 
 
-def make_triangle(size: QSize, up: bool, color: QColor) -> QPixmap:
-    pm = _blank(size)
-    p = _painter(pm)
-    w, h, m = size.width(), size.height(), 2.0
-    if up:
-        pts = [QPointF(w / 2, m), QPointF(w - m, h - m), QPointF(m, h - m)]
-    else:
-        pts = [QPointF(m, m), QPointF(w - m, m), QPointF(w / 2, h - m)]
-    p.setBrush(QBrush(color))
-    p.drawPolygon(QPolygonF(pts))
+def fit(pm: QPixmap, size: QSize) -> QPixmap:
+    """Scale to fit `size` keeping the aspect ratio, centred on a transparent
+    canvas of exactly `size`.
+
+    GEO rects are therefore bounding boxes, not exact art dimensions: artwork
+    is never stretched, so a rect that is slightly the wrong shape shows a
+    little slack rather than a squashed picture.
+    """
+    canvas = QPixmap(size)
+    canvas.fill(Qt.transparent)
+    sc = pm.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    p = QPainter(canvas)
+    p.drawPixmap((size.width() - sc.width()) // 2,
+                 (size.height() - sc.height()) // 2, sc)
     p.end()
-    return pm
+    return canvas
 
 
-def make_cheese(size: QSize) -> QPixmap:
-    pm = _blank(size)
-    p = _painter(pm)
-    w, h = size.width(), size.height()
-    path = QPainterPath()
-    path.moveTo(w * 0.86, h * 0.06)
-    path.lineTo(w * 0.98, h * 0.62)
-    path.lineTo(w * 0.02, h * 0.96)
-    path.closeSubpath()
-    p.setBrush(QBrush(C_CHEESE))
-    p.drawPath(path)
-    p.setBrush(QBrush(C_HOLE))
-    for fx, fy, fr in ((0.30, 0.72, 0.075), (0.52, 0.55, 0.055),
-                       (0.70, 0.38, 0.048), (0.46, 0.80, 0.042)):
-        p.drawEllipse(QPoint(int(w * fx), int(h * fy)), int(w * fr), int(w * fr))
-    p.end()
-    return pm
+def load(key: str, size: QSize) -> QPixmap:
+    """Required artwork. check_assets() has already run, so this should not
+    fail; if the file is corrupt rather than missing, say so and stop."""
+    pm = QPixmap(asset_path(ASSETS[key]))
+    if pm.isNull():
+        raise SystemExit(f"[assets] {ASSETS[key]!r} could not be decoded "
+                         f"(needed for {key!r}). Is it a valid PNG?")
+    return pm.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
 
-def make_groove(size: QSize) -> QPixmap:
-    pm = _blank(size)
-    p = _painter(pm)
-    p.setBrush(QBrush(C_BLUE))
-    p.drawRoundedRect(0, 0, size.width(), size.height(), 3, 3)
-    p.end()
-    return pm
-
-
-def make_can(size: QSize, label="DEPLOY\nLINING") -> QPixmap:
-    pm = _blank(size)
-    p = _painter(pm)
-    w, h = size.width(), size.height()
-    lid_h = int(h * 0.20)
-    p.setBrush(QBrush(C_METAL))
-    p.drawRoundedRect(0, lid_h // 2, w, h - lid_h // 2, 10, 10)
-    p.setBrush(QBrush(C_BLUE))
-    p.drawEllipse(0, 0, w, lid_h)
-    p.setBrush(QBrush(C_METAL.lighter(108)))
-    p.drawEllipse(int(w * 0.08), int(lid_h * 0.22), int(w * 0.84), int(lid_h * 0.60))
-    p.setPen(QPen(C_INK))
-    p.setFont(QFont("Arial", 15, QFont.Bold))
-    p.drawText(QRect(0, lid_h, w, h - lid_h), Qt.AlignCenter, label)
-    p.end()
-    return pm
-
-
-def make_hook(size: QSize) -> QPixmap:
-    pm = _blank(size)
-    p = _painter(pm)
-    w, h = size.width(), size.height()
-    t = w * 0.34
-    p.setBrush(QBrush(C_BLUE))
-    p.drawRect(0, 0, int(t), int(h))                    # vertical shaft
-    p.drawRect(0, 0, int(w), int(t * 0.75))             # top bar
-    p.drawRect(int(w - t), 0, int(t), int(h * 0.42))    # short right leg
-    p.end()
-    return pm
-
-
-def make_paw(size: QSize, flip=False) -> QPixmap:
-    pm = _blank(size)
-    p = _painter(pm)
-    w, h = size.width(), size.height()
-    p.setBrush(QBrush(C_PAW))
-    if flip:
-        p.translate(w, 0)
-        p.scale(-1, 1)
-    p.drawEllipse(int(w * 0.18), int(h * 0.38), int(w * 0.74), int(h * 0.58))
-    for fx, fy, fw, fh in ((0.02, 0.30, 0.30, 0.34), (0.26, 0.06, 0.28, 0.32),
-                           (0.56, 0.02, 0.26, 0.30), (0.80, 0.18, 0.22, 0.28)):
-        p.drawEllipse(int(w * fx), int(h * fy), int(w * fw), int(h * fh))
-    p.end()
-    return pm
-
-
-def make_background(_size=None) -> QPixmap:
-    pm = QPixmap(CANVAS)
-    pm.fill(C_BG)
-    p = _painter(pm)
-    p.drawPixmap(1090, 10, make_paw(QSize(230, 240)))
-    p.drawPixmap(60, 690, make_paw(QSize(230, 250), flip=True))
-    p.end()
-    return pm
-
-
-def load_or(key: str, fallback, size: QSize) -> QPixmap:
+def load_opt(key: str, size: QSize):
+    """Optional artwork - the pressed arrows and the lit group buttons.
+    Returns None if not configured, and the caller generates a fallback."""
     path = ASSETS.get(key)
-    if path:
-        pm = QPixmap(path)
-        if not pm.isNull():
-            return pm.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        print(f"[assets] could not load {path!r}; using placeholder for {key}")
-    return fallback(size)
+    if not path:
+        return None
+    pm = QPixmap(asset_path(path))
+    if pm.isNull():
+        print(f"[assets] could not decode {path!r} for {key!r}; "
+              "falling back to a generated state")
+        return None
+    return pm.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
 
 # ---------------------------------------------------------------------------
@@ -250,66 +337,264 @@ class ArtButton(QPushButton):
     the hook's empty notch behave the way they look. Because the firmware has
     no watchdog, leaving the button while held also fires `released` - a motor
     left running is worse than a jerky UI.
+
+    rightClicked gives a second action per button without needing more art.
     """
 
-    def __init__(self, pixmap: QPixmap, rect: QRect, parent=None):
+    rightClicked = Signal()
+
+    def __init__(self, pixmap: QPixmap, rect: QRect, parent=None,
+                 down_pixmap: QPixmap = None):
         super().__init__(parent)
-        scaled = pixmap.scaled(rect.size(), Qt.IgnoreAspectRatio,
-                               Qt.SmoothTransformation)
-        self._normal = scaled
-        self._hover = self._tint(scaled, 1.12)
-        self._down = self._tint(scaled, 0.86)
+        fitted = fit(pixmap, rect.size())
+        self._normal = fitted
+        self._hover = self._tint(fitted, 1.10)
+        self._down = (fit(down_pixmap, rect.size())
+                      if down_pixmap is not None and not down_pixmap.isNull()
+                      else self._tint(fitted, 0.88))
         self.setGeometry(rect)
         self.setIconSize(rect.size())
         self.setIcon(QIcon(self._normal))
         self.setCursor(Qt.PointingHandCursor)
         self.setFocusPolicy(Qt.NoFocus)
         self.setStyleSheet("border:none; background:transparent;")
-        mask = scaled.mask()
+        self._apply_mask(self._normal, self._down)
+
+    def _apply_mask(self, *pixmaps):
+        """Clip the widget to the artwork, using the UNION of every state.
+
+        setMask clips all painting, not just clicks. Masking to one state
+        would crop any other state that pokes outside it - the deployed can
+        and the wound-in spool have different silhouettes from their off
+        images, so their lit artwork would have been partly invisible.
+        """
+        union = QPixmap(self.size())
+        union.fill(Qt.transparent)
+        p = QPainter(union)
+        for pm in pixmaps:
+            if pm is not None and not pm.isNull():
+                p.drawPixmap(0, 0, pm)
+        p.end()
+        mask = union.mask()
         if not mask.isNull():
             self.setMask(mask)
 
     @staticmethod
     def _tint(pm: QPixmap, factor: float) -> QPixmap:
-        img = pm.toImage().convertToFormat(QImage.Format_ARGB32)
-        for y in range(img.height()):
-            for x in range(img.width()):
-                c = QColor.fromRgba(img.pixel(x, y))
-                if c.alpha() == 0:
-                    continue
-                c = c.lighter(int(factor * 100)) if factor >= 1 \
-                    else c.darker(int(100 / factor))
-                img.setPixel(x, y, c.rgba())
-        return QPixmap.fromImage(img)
+        """Lighten or darken without touching transparent pixels.
+
+        Done with one composited fill rather than a Python pixel loop - at
+        these button sizes the loop version took seconds of startup time.
+        SourceAtop keeps the destination's alpha, so the silhouette survives.
+        """
+        out = pm.copy()
+        shade = 255 if factor >= 1 else 0
+        alpha = min(255, int(abs(1.0 - factor) * 255))
+        p = QPainter(out)
+        p.setCompositionMode(QPainter.CompositionMode_SourceAtop)
+        p.fillRect(out.rect(), QColor(shade, shade, shade, alpha))
+        p.end()
+        return out
+
+    # ---- the four mouse handlers below only swap which picture is showing,
+    # except leaveEvent, which also has a safety job. Qt gives a plain
+    # QPushButton hover/pressed looks for free via its stylesheet; these
+    # buttons are images, so the swap has to be done by hand.
 
     def enterEvent(self, e):
+        """Cursor moved onto the button: show the slightly brighter version."""
         if not self.isDown():
             self.setIcon(QIcon(self._hover))
         super().enterEvent(e)
 
     def leaveEvent(self, e):
+        """Cursor left the button. Two jobs:
+
+        1. Go back to the normal picture.
+        2. SAFETY. If the mouse slides off while the button is still held, a
+           press-and-hold control would otherwise never see its release and
+           the motor would keep running - the stepper has no timeout. Force
+           the release here so 'S' is sent.
+        """
         if self.isDown():
             self.setDown(False)
-            self.released.emit()      # safety stop
+            self.released.emit()
         self.setIcon(QIcon(self._normal))
         super().leaveEvent(e)
 
     def mousePressEvent(self, e):
+        """Button pushed down: show the pressed artwork.
+
+        Right-click is diverted to rightClicked and deliberately does NOT go
+        to super(), so it cannot start a press-and-hold the user can never
+        end. Nothing uses right-click at the moment.
+        """
+        if e.button() == Qt.RightButton:
+            self.rightClicked.emit()
+            return
         self.setIcon(QIcon(self._down))
         super().mousePressEvent(e)
 
     def mouseReleaseEvent(self, e):
+        """Button let go: back to hover if the cursor is still over it,
+        otherwise the normal picture. super() is what emits `clicked`."""
         self.setIcon(QIcon(self._hover if self.underMouse() else self._normal))
         super().mouseReleaseEvent(e)
 
 
+class SelectableButton(ArtButton):
+    """An ArtButton that shows whether it is the active choice in a group.
+
+    Selected draws the "_on" artwork if you supplied one, otherwise the base
+    image at full strength. Unselected fades the image toward the background,
+    which is what the pale blue shapes in the mockup are.
+    """
+
+    def __init__(self, pixmap: QPixmap, rect: QRect, parent=None,
+                 on_pixmap: QPixmap = None, selected=False):
+        super().__init__(pixmap, rect, parent)
+        fitted = fit(pixmap, rect.size())
+        has_on = on_pixmap is not None and not on_pixmap.isNull()
+        self._sel_pm = fit(on_pixmap, rect.size()) if has_on else fitted
+        # With separate on/off artwork the off state is used as drawn. Without
+        # it, fade the base image toward the background so the two states still
+        # read differently.
+        self._unsel_pm = fitted if has_on else self._fade(fitted, 0.45)
+        self._selected = None
+        # Both states must be clickable and fully visible, so widen the mask
+        # the base class built from the off artwork alone.
+        self._apply_mask(self._sel_pm, self._unsel_pm)
+        self.set_selected(selected)
+
+    @staticmethod
+    def _fade(pm: QPixmap, amount: float) -> QPixmap:
+        """Blend toward the panel background, keeping the alpha shape intact."""
+        out = pm.copy()
+        p = QPainter(out)
+        p.setCompositionMode(QPainter.CompositionMode_SourceAtop)
+        p.fillRect(out.rect(), QColor(C_BG.red(), C_BG.green(), C_BG.blue(),
+                                      int(amount * 255)))
+        p.end()
+        return out
+
+    def set_selected(self, on: bool):
+        """THIS is what swaps the artwork between the on and off images.
+
+        Called only by ButtonGroup - never call it directly, or the group's
+        idea of what is selected and the picture on screen will disagree.
+        """
+        if on == self._selected:
+            return
+        self._selected = on
+        self._normal = self._sel_pm if on else self._unsel_pm
+        self._hover = self._tint(self._normal, 1.12)
+        self._down = self._tint(self._normal, 0.86)
+        self.setIcon(QIcon(self._normal))
+
+    def is_selected(self) -> bool:
+        return bool(self._selected)
+
+
+class Toggle:
+    """ONE button that flips between two states, each with its own command.
+
+    This is the other kind of control. ButtonGroup below is "pick one of
+    several, the rest go dark" - that is the hook, where three positions share
+    one servo. A Toggle is a single button that alternates: click it and it
+    sends the on command and shows the lit artwork, click again and it sends
+    the off command and goes back. The picture is always the last state you
+    commanded, so the button doubles as the readout.
+
+    The can and the spool are one of these each, because they are separate
+    mechanisms and neither constrains the other.
+    """
+
+    def __init__(self, button: SelectableButton, spec, on_change):
+        # spec is (off_cmd, on_cmd, off_label, on_label, starts_on)
+        self.off_cmd, self.on_cmd, self.off_label, self.on_label, start = spec
+        self.button = button
+        self.on_change = on_change
+        self._on = bool(start)
+        button.set_selected(self._on)
+        # Same Qt trap as ButtonGroup.add: clicked carries a bool, so swallow
+        # any argument rather than let it become a parameter we care about.
+        button.clicked.connect(lambda *_a: self.flip())
+
+    def flip(self):
+        self.set(not self._on)
+
+    def set(self, on: bool):
+        """Command a state. Sends even if already there, so a click always
+        re-commands the hardware rather than silently doing nothing."""
+        self._on = bool(on)
+        self.button.set_selected(self._on)
+        self.on_change(self.on_cmd if self._on else self.off_cmd, self._on)
+
+    def is_on(self) -> bool:
+        return self._on
+
+    def label(self) -> str:
+        return self.on_label if self._on else self.off_label
+
+
+class ButtonGroup:
+    """Mutually exclusive set of SelectableButtons - "radio buttons".
+
+    This is the thing that makes "only one of the three can be on". Clicking a
+    member selects it, switches every other member off, and fires its command.
+    Each button still has just two states, on and off; the group is what
+    guarantees exactly one of them is on.
+
+    Clicking the already-selected member re-fires its command, because for the
+    lining group that means "run it again" rather than "do nothing".
+
+    Membership is declared by calling add() once per button - see
+    Panel._build_controls, where self.lining gets D and R, and self.hook gets
+    one entry per row of HOOK_POSITIONS.
+    """
+
+    def __init__(self, on_choose):
+        self.on_choose = on_choose
+        self.items = {}          # key -> SelectableButton
+
+    def add(self, key, button: SelectableButton):
+        """Put a button in this group. Called once per button; the group then
+        owns its selected/unselected state for the rest of the session."""
+        self.items[key] = button
+        # The *_a is load-bearing. QPushButton.clicked carries a `checked`
+        # bool, and PySide6 passes it to any slot willing to take an argument.
+        # With `lambda k=key:` that bool lands in k, so every click called
+        # choose(False): no key matched, every button switched off, and the
+        # command was sent as a bool. Swallow the Qt argument instead.
+        button.clicked.connect(lambda *_a, k=key: self.choose(k))
+
+    def choose(self, key):
+        for k, b in self.items.items():
+            b.set_selected(k == key)
+        self.on_choose(key)
+
+    def set_selected(self, key):
+        """Reflect state without firing the command."""
+        for k, b in self.items.items():
+            b.set_selected(k == key)
+
+    def selected(self):
+        for k, b in self.items.items():
+            if b.is_selected():
+                return k
+        return None
+
+
 class ImageSlider(QSlider):
-    """Horizontal slider drawn from a groove pixmap and a handle pixmap.
-    Click anywhere to jump, drag to scrub."""
+    """Vertical slider drawn from a groove pixmap and a handle pixmap.
+
+    Top is maximum, matching the big sun above and the small sun below.
+    Click anywhere to jump, drag to scrub.
+    """
 
     def __init__(self, handle: QPixmap, groove: QPixmap, rect: QRect,
                  lo=0, hi=9, parent=None):
-        super().__init__(Qt.Horizontal, parent)
+        super().__init__(Qt.Vertical, parent)
         self._handle = handle
         self._groove = groove
         self.setGeometry(rect)
@@ -319,42 +604,60 @@ class ImageSlider(QSlider):
         self.setFocusPolicy(Qt.NoFocus)
 
     def _travel(self) -> int:
-        return max(1, self.width() - self._handle.width())
+        return max(1, self.height() - self._handle.height())
+
+    def _frac(self) -> float:
+        span = max(1, self.maximum() - self.minimum())
+        return (self.value() - self.minimum()) / span
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
-        gx = self._handle.width() // 2
-        gy = (self.height() - self._groove.height()) // 2
+        gy = self._handle.height() // 2
+        gx = (self.width() - self._groove.width()) // 2
         p.drawPixmap(gx, gy, self._groove.scaled(
-            max(1, self.width() - gx), self._groove.height(),
+            self._groove.width(), max(1, self.height() - self._handle.height()),
             Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
-        frac = (self.value() - self.minimum()) / max(1, self.maximum() - self.minimum())
-        hy = (self.height() - self._handle.height()) // 2
-        p.drawPixmap(int(frac * self._travel()), hy, self._handle)
+        # frac 1.0 is the TOP of the widget, so invert for y.
+        hy = int((1.0 - self._frac()) * self._travel())
+        hx = (self.width() - self._handle.width()) // 2
+        p.drawPixmap(hx, hy, self._handle)
         p.end()
 
-    def _set_from_x(self, x: float):
-        frac = (x - self._handle.width() / 2) / self._travel()
+    def _set_from_y(self, y: float):
+        frac = 1.0 - (y - self._handle.height() / 2) / self._travel()
         frac = min(1.0, max(0.0, frac))
         self.setValue(round(self.minimum() + frac * (self.maximum() - self.minimum())))
 
     def mousePressEvent(self, e):
-        self._set_from_x(e.position().x())
+        self._set_from_y(e.position().y())
 
     def mouseMoveEvent(self, e):
-        self._set_from_x(e.position().x())
+        self._set_from_y(e.position().y())
+
+
+def bgr_to_qimage(bgr) -> QImage:
+    """OpenCV BGR ndarray -> QImage.
+
+    The .copy() is not optional: QImage wraps the numpy buffer without owning
+    it, so once the array is garbage collected the pixmap shows torn memory.
+    """
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    h, w = rgb.shape[:2]
+    rgb = np.ascontiguousarray(rgb)
+    return QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
 
 
 class VideoPane(QLabel):
-    def __init__(self, rect: QRect, active: bool, parent=None):
+    def __init__(self, rect: QRect, active: bool, parent=None, border_px=2):
         super().__init__(parent)
+        self._bw = max(1, border_px)
         self.setGeometry(rect)
         self.setAlignment(Qt.AlignCenter)
         self.set_active(active)
 
     def set_active(self, active: bool):
-        border = f"2px solid {C_BLUE.name()}" if active else "none"
+        border = f"{self._bw}px solid {C_BLUE.name()}" if active else "none"
         self.setStyleSheet(f"background:#000000; border:{border};")
 
     def show_frame(self, img: QImage):
@@ -381,7 +684,9 @@ class SerialLink(QObject):
     on the GUI thread). Writer thread drains a queue so no button handler can
     ever block on serial IO."""
 
-    frame_ready = Signal(str, QImage)     # "L"/"R", image
+    # Raw JPEG bytes, not a QImage: the panel decodes once with OpenCV so the
+    # same ndarray feeds both the CV pipeline and the display.
+    frame_ready = Signal(str, bytes)      # "L"/"R", jpeg
     telemetry = Signal(str)
     link_state = Signal(str)
 
@@ -484,10 +789,8 @@ class SerialLink(QObject):
             end = payload.rfind(EOI)
             if end < 0:
                 continue
-            img = QImage.fromData(payload[:end + 2], "JPG")
-            if not img.isNull():
-                self._tick(cam)
-                self.frame_ready.emit(cam, img)
+            self._tick(cam)
+            self.frame_ready.emit(cam, payload[:end + 2])
 
     def _tick(self, cam):
         now = time.time()
@@ -497,6 +800,8 @@ class SerialLink(QObject):
             self.fps[cam] = 0.85 * self.fps[cam] + 0.15 * (1.0 / dt)
 
     def _sim(self):
+        """Animated test pattern, encoded to JPEG so it goes through exactly
+        the same decode path as a real frame."""
         w, h = 320, 240
         t0 = time.time()
         while not self._stop.is_set():
@@ -517,12 +822,16 @@ class SerialLink(QObject):
                 p.setBrush(Qt.NoBrush)
                 p.drawRect(int(cx - 34), int(cy - 22), 68, 44)
                 p.setFont(QFont("Arial", 9))
-                p.drawText(int(cx - 34), int(cy - 27), "crack 0.87")
+                p.drawText(int(cx - 34), int(cy - 27), "sim target")
                 p.setPen(QPen(QColor("#8899AA"), 1))
                 p.drawText(8, 16, f"SIMULATED {cam}")
                 p.end()
+
+                buf = QBuffer()
+                buf.open(QBuffer.WriteOnly)
+                img.save(buf, "JPG", 80)
                 self._tick(cam)
-                self.frame_ready.emit(cam, img.copy())
+                self.frame_ready.emit(cam, bytes(buf.data()))
             time.sleep(1 / 20)
 
 
@@ -532,95 +841,199 @@ class SerialLink(QObject):
 
 class Panel(QWidget):
 
-    def __init__(self, link: SerialLink):
+    def __init__(self, link: SerialLink, use_cv=True, conf=0.4,
+                 win_size: QSize = None):
         super().__init__()
         self.link = link
+        self._use_cv = use_cv and HAVE_CV
+        self._conf = conf
         self.setWindowTitle("rat #88")
-        self.setFixedSize(CANVAS)
+
+        # The mockup is authored at 1280x960. Rather than reflow the layout for
+        # each screen, the whole design is scaled by a single factor and
+        # centred, so GEO stays in design coordinates and the proportions the
+        # artwork was drawn for are preserved. Uniform scale, never stretched.
+        win = win_size or CANVAS
+        self.setFixedSize(win)
+        self.S = min(win.width() / CANVAS.width(), win.height() / CANVAS.height())
+        self.ox = int((win.width() - CANVAS.width() * self.S) / 2)
+        self.oy = int((win.height() - CANVAS.height() * self.S) / 2)
+        self.win = win
         self.setFocusPolicy(Qt.StrongFocus)      # needed for arrow-key driving
 
-        self.hook_out = False
+        self.hook_pos = HOOK_BOOT    # HookServo::begin parks at 180 == 'H'
+        self.act_until = 0.0
+        self.act_dir = ""
         self._led_last = None
         self._last_cmd = "-"
         self._telem = {}
         self._telem_seen = 0.0
         self.link_text = "starting"
+        self._det_count = 0
+        self._nearest = None
+
+        # CV is optional at every level: missing opencv, missing ultralytics,
+        # missing CV.pt and missing stereo_calib.npz each degrade separately
+        # rather than stopping the panel from opening.
+        self.cv = None
+        self.cv_note = CV_IMPORT_ERROR or ""
+        if self._use_cv:
+            self.cv = scv.CVWorker(conf=self._conf)
+            self.cv.start()
+            notes = []
+            if self.cv.cv_error:
+                notes.append(self.cv.cv_error)
+            if not self.cv.calib.ok:
+                notes.append(self.cv.calib.error or "no calibration")
+            self.cv_note = "  |  ".join(notes)
 
         self._build_background()
         self._build_video()
         self._build_controls()
-        self._build_status()
+        # self._build_status()
 
         link.frame_ready.connect(self.on_frame)
         link.telemetry.connect(self.on_telemetry)
         link.link_state.connect(self._set_link_text)
 
-        self.ticker = QTimer(self)
-        self.ticker.timeout.connect(self.refresh_status)
-        self.ticker.start(200)
+        # self.ticker = QTimer(self)
+        # self.ticker.timeout.connect(self.refresh_status)
+        # self.ticker.start(200)
+
+    # -- geometry ----------------------------------------------------------
+    def g(self, key: str) -> QRect:
+        """Design-space rect -> on-screen rect."""
+        r = GEO[key]
+        S = self.S
+        return QRect(int(r.x() * S) + self.ox, int(r.y() * S) + self.oy,
+                     int(r.width() * S), int(r.height() * S))
+
+    def px(self, n: float) -> int:
+        """Design-space length (font size, pixmap edge) -> on-screen pixels."""
+        return max(1, int(round(n * self.S)))
 
     # -- construction ------------------------------------------------------
     def _build_background(self):
-        pm = load_or("background", make_background, CANVAS)
+        pm = load("background", CANVAS)
         self.bg = QLabel(self)
-        self.bg.setGeometry(QRect(QPoint(0, 0), CANVAS))
-        self.bg.setPixmap(pm.scaled(CANVAS, Qt.IgnoreAspectRatio,
+        self.bg.setGeometry(QRect(QPoint(0, 0), self.win))
+        # "Cover", not "stretch": fill the screen and crop the overflow so the
+        # artwork keeps its proportions on a wider-than-4:3 laptop panel.
+        self.bg.setPixmap(pm.scaled(self.win, Qt.KeepAspectRatioByExpanding,
                                     Qt.SmoothTransformation))
+        self.bg.setAlignment(Qt.AlignCenter)
 
-        self.title = QLabel("rat #88", self)
-        self.title.setGeometry(GEO["title"])
+        # Decorations sit above the plate but below every control. Created
+        # first so Qt's sibling stacking puts the buttons on top of them.
+        self.decor = []
+        for key in ("header", "mouse_top", "mouse_bottom"):
+            rect = self.g(key)
+            lbl = QLabel(self)
+            lbl.setGeometry(rect)
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setScaledContents(False)
+            lbl.setPixmap(fit(load(key, rect.size()), rect.size()))
+            self.decor.append(lbl)
+
+        self.bezel = QLabel(self)
+        self.bezel.setGeometry(self.g("bezel"))
+        self.bezel.setPixmap(load("bezel", self.g("bezel").size()).scaled(
+            self.g("bezel").size(), Qt.IgnoreAspectRatio,
+            Qt.SmoothTransformation))
+
+        # Drawn over the header art, which is only the rat and its footprints.
+        self.title = QLabel(TITLE_TEXT, self)
+        self.title.setGeometry(self.g("title"))
         self.title.setAlignment(Qt.AlignCenter)
         self.title.setStyleSheet(
-            f"color:{C_INK.name()}; font-family:Arial; font-size:64px;"
-            "font-weight:800; background:transparent;")
+            f"color:{C_INK.name()}; font-family:Arial;"
+            f"font-size:{self.px(64)}px; font-weight:800; background:transparent;")
 
     def _build_video(self):
+        bw = self.px(2)
         self.panes = {
-            "L": VideoPane(GEO["video_left"], active=True, parent=self),
-            "R": VideoPane(GEO["video_right"], active=False, parent=self),
+            "L": VideoPane(self.g("video_left"), True, self, bw),
+            "R": VideoPane(self.g("video_right"), False, self, bw),
         }
 
     def _build_controls(self):
-        g = GEO
-        up = load_or("arrow_up", lambda s: make_triangle(s, True, C_RED), g["arrow_up"].size())
-        dn = load_or("arrow_down", lambda s: make_triangle(s, False, C_RED), g["arrow_down"].size())
+        G = self.g
 
-        self.btn_fwd = ArtButton(up, g["arrow_up"], self)
+        # ---- drive: press and hold, because the stepper has no timeout ----
+        up = load("arrow_up", G("arrow_up").size())
+        dn = load("arrow_down", G("arrow_down").size())
+
+        up_d = load_opt("arrow_up_down", G("arrow_up").size())
+        dn_d = load_opt("arrow_down_down", G("arrow_down").size())
+
+        self.btn_fwd = ArtButton(up, G("arrow_up"), self, up_d)
         self.btn_fwd.setToolTip("Drive forward — hold, or Up arrow key")
         self.btn_fwd.pressed.connect(lambda: self.drive("F"))
         self.btn_fwd.released.connect(lambda: self.send("S"))
 
-        self.btn_back = ArtButton(dn, g["arrow_down"], self)
+        self.btn_back = ArtButton(dn, G("arrow_down"), self, dn_d)
         self.btn_back.setToolTip("Drive back — hold, or Down arrow key")
         self.btn_back.pressed.connect(lambda: self.drive("B"))
         self.btn_back.released.connect(lambda: self.send("S"))
 
-        can = load_or("can", make_can, g["can"].size())
-        self.btn_act = ArtButton(can, g["can"], self)
-        self.btn_act.setToolTip("Deploy lining — hold to extend, release to stop")
-        self.btn_act.pressed.connect(lambda: self.send("D"))
-        self.btn_act.released.connect(lambda: self.send("X"))
+        # ---- two independent toggles, one per mechanism -------------------
+        # Separate hardware, so neither constrains the other: the lining is
+        # the actuator, the spool is its own servo on PIN_SPOOL.
+        can_btn = SelectableButton(load("can", G("can").size()), G("can"), self,
+                                   load_opt("can_on", G("can").size()))
+        can_btn.setToolTip(
+            f"Lining actuator — click to deploy ('{LINING[1]}'), "
+            f"click again to retract ('{LINING[0]}').\n"
+            f"Firmware cuts the motor after {ACT_RUN_S:.0f}s either way.\n"
+            "Space stops it immediately.")
+        self.lining = Toggle(can_btn, LINING, self.on_lining)
 
-        hook = load_or("hook", make_hook, g["hook"].size())
-        self.btn_hook = ArtButton(hook, g["hook"], self)
-        self.btn_hook.setToolTip("Click to deploy hook, click again to release")
-        self.btn_hook.clicked.connect(self.toggle_hook)
+        spool_btn = SelectableButton(load("spool", G("spool").size()),
+                                     G("spool"), self,
+                                     load_opt("spool_on", G("spool").size()))
+        spool_btn.setToolTip(
+            f"Spool servo — click to wind in ('{SPOOL[1]}'), "
+            f"click again to pay out ('{SPOOL[0]}').\n"
+            "A servo parks itself, so there is nothing to stop.")
+        self.spool = Toggle(spool_btn, SPOOL, self.on_spool)
 
-        handle = load_or("cheese", make_cheese, QSize(100, 72))
-        groove = load_or("groove", make_groove, QSize(242, 26))
+        # ---- hook group: exactly one position lit at a time ---------------
+        # Built straight from HOOK_POSITIONS so the buttons, the commands, the
+        # status labels and the keyboard shortcuts can never drift apart.
+        self.hook = ButtonGroup(self.on_hook)
+        for name, cmd, angle, label in HOOK_POSITIONS:
+            rect = G(name)
+            btn = SelectableButton(load(name, rect.size()), rect, self,
+                                   load_opt(name + "_on", rect.size()))
+            btn.setToolTip(f"{label}  ({cmd}, {angle}°)\n"
+                           f"Keyboard: {cmd}")
+            self.hook.add(cmd, btn)
+        # Reflect the real boot position without sending a command.
+        self.hook.set_selected(self.hook_pos)
+
+        # ---- lamp: vertical, bright at the top ----------------------------
+        self.sun_max = QLabel(self)
+        self.sun_max.setGeometry(G("sun_max"))
+        self.sun_max.setPixmap(load("sun_max", G("sun_max").size()))
+        self.sun_min = QLabel(self)
+        self.sun_min.setGeometry(G("sun_min"))
+        self.sun_min.setPixmap(load("sun_min", G("sun_min").size()))
+
+        handle = load("cheese", QSize(self.px(103), self.px(70)))
+        groove = load("groove", QSize(self.px(104), self.px(330)))
         # Firmware maps the characters '0'-'9' onto 0-255, so the slider is 0-9
         # and one character carries the level.
-        self.slider = ImageSlider(handle, groove, g["slider"], 0, 9, self)
-        self.slider.setToolTip("Lamp brightness (0-9)")
+        self.slider = ImageSlider(handle, groove, G("slider"), 0, 9, self)
+        self.slider.setToolTip("Lamp brightness (0 bottom - 9 top)")
         self.slider.valueChanged.connect(self.on_led)
 
-    def _build_status(self):
-        self.status = QLabel(self)
-        self.status.setGeometry(GEO["status"])
-        self.status.setAlignment(Qt.AlignCenter)
-        self.status.setStyleSheet(
-            f"color:{C_INK.name()}; font-family:Menlo,Consolas,monospace;"
-            "font-size:12px; background:transparent;")
+    # def _build_status(self):
+    #     self.status = QLabel(self)
+    #     self.status.setGeometry(self.g("status"))
+    #     self.status.setAlignment(Qt.AlignCenter)
+    #     self.status.setStyleSheet(
+    #         f"color:{C_INK.name()}; font-family:Menlo,Consolas,monospace;"
+    #         f"font-size:{self.px(11)}px; background:transparent;")
 
     # -- commands ----------------------------------------------------------
     def send(self, ch: str):
@@ -628,14 +1041,46 @@ class Panel(QWidget):
         self._last_cmd = ch
 
     def drive(self, ch: str):
-        if INTERLOCK_HOOK_BLOCKS_DRIVE and self.hook_out:
+        if INTERLOCK_HOOK_BLOCKS_DRIVE and self.hook_pos == "H":
             self._last_cmd = "blocked: hook out"
             return
         self.send(ch)
 
-    def toggle_hook(self):
-        self.hook_out = not self.hook_out
-        self.send("H" if self.hook_out else "U")
+    # Both handlers are called BY the Toggle, never directly. The Toggle has
+    # already flipped its own state and swapped its artwork; all these do is
+    # put the character on the wire and update the status line.
+    #   ch  - the command character for the state just entered
+    #   on  - True if that is the "on" state, for wording the status text
+
+    def on_lining(self, ch: str, on: bool):
+        """Lining actuator: 'D' deploys, 'R' retracts.
+
+        This is a MOTOR, so the move takes real time. act_until is a countdown
+        display only - it does not stop anything. Actuator::update() on the
+        ESP32 is what cuts the power, after MAX_RUN_MS. We mirror the same
+        duration here purely so the status line can show how long is left.
+        """
+        self.send(ch)
+        self.act_until = time.time() + ACT_RUN_S
+        self.act_dir = "deploying" if on else "retracting"
+
+    def on_spool(self, ch: str, on: bool):
+        """Spool servo: 'T' winds in (180 deg), 'Y' pays out (90 deg).
+
+        No countdown, because a servo is not a motor that runs. setAngle drives
+        it to the angle and holds there, so there is nothing to time and
+        nothing to stop.
+        """
+        self.send(ch)
+
+    def on_hook(self, ch: str):
+        """Servo positions: A assemble, H hold the loops, U release."""
+        self.send(ch)
+        self.hook_pos = ch
+
+    def set_hook(self, ch: str):
+        """Move the hook and keep the button group in step."""
+        self.hook.choose(ch)
 
     def on_led(self, v: int):
         # Only send on change; a drag otherwise floods the port and competes
@@ -645,8 +1090,18 @@ class Panel(QWidget):
             self.send(str(v))
 
     def stop_all(self):
+        """Panic: stop the drive and cut the lining actuator.
+
+        The toggle is deliberately left where it is. Stopping mid-travel means
+        the lining is somewhere between compressed and deployed, and flipping
+        the button back would claim a position the hardware is not in. The
+        status line says "stopped" instead. Servos are not touched - they are
+        already parked and holding.
+        """
         self.send("S")
         self.link.send("X")
+        self.act_until = 0.0
+        self.act_dir = "stopped"
 
     # -- events ------------------------------------------------------------
     def keyPressEvent(self, e):
@@ -661,6 +1116,16 @@ class Panel(QWidget):
             self.stop_all()
         elif k == Qt.Key_Z:
             self.send("Z")
+        elif e.text().upper() in HOOK_LABEL:
+            self.set_hook(e.text().upper())
+        elif e.text().upper() == LINING[1]:      # D - deploy
+            self.lining.set(True)
+        elif e.text().upper() == LINING[0]:      # R - retract
+            self.lining.set(False)
+        elif e.text().upper() == SPOOL[1]:       # T - wind in
+            self.spool.set(True)
+        elif e.text().upper() == SPOOL[0]:       # Y - pay out
+            self.spool.set(False)
         elif k == Qt.Key_Escape:
             self.close()
 
@@ -679,11 +1144,42 @@ class Panel(QWidget):
         super().changeEvent(e)
 
     # -- inbound -----------------------------------------------------------
-    def on_frame(self, cam: str, img: QImage):
-        # Plug crack_tracker.py in here if you want boxes on the showcase feed.
+    def on_frame(self, cam: str, jpeg: bytes):
         pane = self.panes.get(cam)
-        if pane:
-            pane.show_frame(img)
+        if pane is None:
+            return
+
+        if not self._use_cv:
+            img = QImage.fromData(jpeg, "JPG")
+            if not img.isNull():
+                pane.show_frame(img)
+            return
+
+        bgr = scv.decode(jpeg, cam)          # decode + per-camera rotation
+        if bgr is None:
+            return
+
+        # Rectify on arrival so display, detection and disparity all share one
+        # coordinate space. Looking up a raw-image centroid in a rectified
+        # disparity map returns a confidently wrong distance.
+        if self.cv and self.cv.calib.ok:
+            bgr = self.cv.calib.rectify_one(bgr, cam)
+
+        if self.cv:
+            self.cv.submit(bgr if cam == "L" else None,
+                           bgr if cam == "R" else None)
+            if cam == "L":
+                dets, _, _ = self.cv.latest()
+                if dets:
+                    bgr = scv.draw_detections(bgr, dets)
+                    self._det_count = len(dets)
+                    self._nearest = min(
+                        (d[3] for d in dets if d[3] is not None), default=None)
+                else:
+                    self._det_count = 0
+                    self._nearest = None
+
+        pane.show_frame(bgr_to_qimage(bgr))
 
     def on_telemetry(self, line: str):
         vals = _TELEM_RE.findall(line)
@@ -694,21 +1190,47 @@ class Panel(QWidget):
     def _set_link_text(self, t: str):
         self.link_text = t
 
-    def refresh_status(self):
-        age = time.time() - self._telem_seen
-        tel = "  ".join(f"{k}={v}" for k, v in list(self._telem.items())[:4]) \
-            if self._telem and age < 3 else "telemetry: none"
-        self.status.setText(
-            f"{self.link_text}   L {self.link.fps['L']:4.1f}fps   "
-            f"R {self.link.fps['R']:4.1f}fps   "
-            f"hook={'OUT' if self.hook_out else 'IN'}   "
-            f"lamp={self.slider.value()}   sent={self._last_cmd}   {tel}"
-            "        [space]=stop all  [esc]=quit")
+    # def refresh_status(self):
+    #     now = time.time()
+    #     age = now - self._telem_seen
+    #     tel = "  ".join(f"{k}={v}" for k, v in list(self._telem.items())[:4]) \
+    #         if self._telem and age < 3 else "telemetry: none"
+    #     # The countdown only describes the motor. The button keeps showing the
+    #     # state you commanded, because that is where the lining ended up.
+    #     if now < self.act_until:
+    #         motor = f" ({self.act_dir} {self.act_until - now:3.1f}s)"
+    #     elif self.act_dir == "stopped":
+    #         motor = " (stopped)"
+    #     else:
+    #         motor = ""
 
-    def closeEvent(self, e):
-        self.ticker.stop()
-        self.link.stop()
-        super().closeEvent(e)
+    #     if self.cv_note:
+    #         cv_txt = self.cv_note
+    #     elif self.cv:
+    #         _, infer_ms, depth_ms = self.cv.latest()
+    #         near = f"{self._nearest / 10.0:.1f}cm" if self._nearest else "--"
+    #         cv_txt = (f"cracks={self._det_count} nearest={near} "
+    #                   f"yolo={infer_ms:.0f}ms sgbm={depth_ms:.0f}ms")
+    #     else:
+    #         cv_txt = "cv off"
+
+    #     self.status.setText(
+    #         f"{self.link_text}   L {self.link.fps['L']:4.1f}fps   "
+    #         f"R {self.link.fps['R']:4.1f}fps   "
+    #         f"hook={HOOK_LABEL.get(self.hook_pos, '?')}   "
+    #         f"lining={self.lining.label()}{motor}   "
+    #         f"spool={self.spool.label()}   "
+    #         f"lamp={self.slider.value()}   sent={self._last_cmd}\n"
+    #         f"{cv_txt}   {tel}     "
+    #         f"[{'/'.join(HOOK_LABEL)}]=hook  [D/R]=lining  [T/Y]=spool  "
+    #         "[space]=stop all  [esc]=quit")
+
+    # def closeEvent(self, e):
+    #     self.ticker.stop()
+    #     if self.cv:
+    #         self.cv.stop()
+    #     self.link.stop()
+    #     super().closeEvent(e)
 
 
 # ---------------------------------------------------------------------------
@@ -718,6 +1240,19 @@ def main():
     ap.add_argument("--port", default=None)
     ap.add_argument("--baud", type=int, default=921600)
     ap.add_argument("--sim", action="store_true", help="ignore hardware")
+    ap.add_argument("--fullscreen", action="store_true", default=True,
+                    help="fill the whole display (default)")
+    ap.add_argument("--maximised", "--maximized", dest="fullscreen",
+                    action="store_false",
+                    help="fill the screen but keep the menu bar and Dock")
+    ap.add_argument("--windowed", action="store_true",
+                    help="fixed 1280x960 window, for layout tweaking")
+    ap.add_argument("--width", type=int, default=None,
+                    help="explicit width; height follows the 4:3 design")
+    ap.add_argument("--no-cv", action="store_true",
+                    help="skip YOLO and stereo depth")
+    ap.add_argument("--conf", type=float, default=0.4,
+                    help="detection confidence threshold")
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args()
 
@@ -734,11 +1269,36 @@ def main():
         print("No serial port found — starting in SIM mode. "
               "Use --list to see ports, or --port to pick one.")
 
+    problems = check_assets()
+    if problems:
+        print("Artwork problems — fix ASSETS at the top of this file:")
+        print("\n".join(problems))
+        return 1
+
+    if not HAVE_CV and not args.no_cv:
+        print(f"CV disabled ({CV_IMPORT_ERROR}) — video only. "
+              "pip3 install opencv-python ultralytics")
+
     app = QApplication(sys.argv)
-    link = SerialLink(port, args.baud)
-    panel = Panel(link)
-    link.start()
-    panel.show()
+
+    # availableGeometry excludes the macOS menu bar and Dock, so a --windowed
+    # panel is never partly off-screen; fullscreen uses the whole display.
+    screen = app.primaryScreen()
+    if args.windowed:
+        win = CANVAS
+    elif args.width:
+        win = QSize(args.width, int(args.width * CANVAS.height() / CANVAS.width()))
+    else:
+        geo = screen.geometry() if args.fullscreen else screen.availableGeometry()
+        win = geo.size()
+
+    panel = Panel(SerialLink(port, args.baud), use_cv=not args.no_cv,
+                  conf=args.conf, win_size=win)
+    panel.link.start()
+    if args.fullscreen:
+        panel.showFullScreen()
+    else:
+        panel.show()
     panel.raise_()
     panel.activateWindow()
     panel.setFocus()
