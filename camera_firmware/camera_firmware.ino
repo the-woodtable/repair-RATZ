@@ -24,13 +24,18 @@
   GND while resetting to enter bootloader. Disconnect adapter after.
 
   -------------------------------------------------------------------
-  RESOLUTION CHANGE (bumped from QVGA to VGA for sharper CV detection):
-    frame_size raised 320x240 -> 640x480. This INVALIDATES any existing
-    stereo_calib.npz (it was computed for 320x240 images) — recalibrate
-    with stereo_calibrate.py after reflashing BOTH cameras. jpeg_quality
-    was also lowered (= less compression, more detail) to complement the
-    resolution bump. Expect a lower fps than before — bigger, higher
-    quality frames take longer to transmit over the UART link.
+  RESOLUTION CHANGE (bumped from QVGA up toward VGA for sharper CV
+  detection, then dialed back to CIF once VGA proved too much data for
+  BOTH cameras to stream together reliably):
+    frame_size raised 320x240 -> 400x296 (CIF). This INVALIDATES any
+    existing stereo_calib.npz (it was computed for 320x240 images) --
+    recalibrate with stereo_calibrate.py after reflashing BOTH cameras.
+    jpeg_quality was also lowered (= less compression, more detail) to
+    complement the resolution bump. If fps still feels low with both
+    cameras running, that's the two-camera bandwidth-sharing limit --
+    drop back toward FRAMESIZE_QVGA rather than raising jpeg_quality
+    further, since quality has less room to give before frames grow
+    close to VGA size again.
   -------------------------------------------------------------------
   RECOVERY BEHAVIOR (added after field testing showed the stream could
   freeze permanently on a single glitch):
@@ -141,10 +146,15 @@ void setup() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  // Raised from FRAMESIZE_QVGA (320x240) for sharper crack detection.
+  // Raised from FRAMESIZE_QVGA (320x240) for sharper crack detection,
+  // set to CIF rather than VGA -- VGA alone streamed fine on ONE camera
+  // but caused stream desync once BOTH ran together (too much combined
+  // data for the shared link to the S3/laptop). CIF is a middle ground:
+  // ~1.6x QVGA's pixel count (a real detail improvement) but only ~40%
+  // of VGA's data size.
   // INVALIDATES stereo_calib.npz (computed for the old 320x240 size) --
   // recalibrate with stereo_calibrate.py after reflashing BOTH cameras.
-  config.frame_size = FRAMESIZE_VGA;   // 640x480
+  config.frame_size = FRAMESIZE_CIF;   // 400x296
 
   if (psramFound()) {
     // Lowered from 20 (less compression, more detail).

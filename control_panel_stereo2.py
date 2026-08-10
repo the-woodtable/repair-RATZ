@@ -70,7 +70,7 @@ MAX_COLOUR_JUMP = 45.0
 
 # Crack/hole detection model. Set to your trained weights path.
 CV_MODEL_PATH = os.path.join(HERE, "CV.pt")
-CV_CONF = 0.4
+CV_CONF = 0.2
 
 # Rotation applied to each camera on arrival: 0, 90, 180 or 270 clockwise.
 # PER CAMERA, because the two are not necessarily mounted the same way —
@@ -615,7 +615,7 @@ class App:
                                   bg="#1e1e1e", fg="#ccc", highlightthickness=0,
                                   troughcolor="#333", length=200,
                                   command=self._on_led_scale)
-        self.led_scale.set(9)
+        self.led_scale.set(1)
         self.led_scale.grid(row=2, column=1, columnspan=3, sticky="w")
 
         # Telemetry echo — confirms the S3 heard you. If you press LED ON and
