@@ -582,11 +582,19 @@ class App:
         rob = tk.LabelFrame(body, text="Robot", bg="#1e1e1e", fg="#ccc")
         rob.pack(fill="x", padx=8, pady=4)
 
-        # Drive: press-and-hold. There is no dead-man watchdog in the current
-        # firmware, so the motor runs until it's told to stop — release must
-        # send 'S'. STOP ALL is the panic button.
-        self._hold_btn(rob, "▲ FWD", "F", "S", 0, 0)
-        self._hold_btn(rob, "▼ BACK", "B", "S", 0, 1)
+        # Drive: TOGGLE, not hold-to-move. Click once to start moving that
+        # direction, click the same button again (or STOP ALL) to stop.
+        # The firmware has no dead-man watchdog either way -- it just runs
+        # until told 'S' -- so toggle mode isn't giving up any safety the
+        # firmware already had; it just removes the "must hold the mouse
+        # down" requirement the old hold-to-move buttons added on top.
+        self.drive_state = 0   # 0 = stopped, +1 = forward, -1 = backward
+        self.fwd_btn = tk.Button(rob, text="▲ FWD", width=10,
+                                 command=self._toggle_forward)
+        self.fwd_btn.grid(row=0, column=0, padx=3, pady=3)
+        self.back_btn = tk.Button(rob, text="▼ BACK", width=10,
+                                  command=self._toggle_backward)
+        self.back_btn.grid(row=0, column=1, padx=3, pady=3)
         # NOTE: macOS Tk ignores `bg` on a Button and draws the native white
         # widget, so bg="#8b0000" + fg="white" rendered as white-on-white —
         # an invisible panic button. Colour the TEXT instead; that is honoured
@@ -615,7 +623,7 @@ class App:
                                   bg="#1e1e1e", fg="#ccc", highlightthickness=0,
                                   troughcolor="#333", length=200,
                                   command=self._on_led_scale)
-        self.led_scale.set(1)
+        self.led_scale.set(4)
         self.led_scale.grid(row=2, column=1, columnspan=3, sticky="w")
 
         # Telemetry echo — confirms the S3 heard you. If you press LED ON and
@@ -668,6 +676,8 @@ class App:
             os.makedirs(d, exist_ok=True)
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._release_jobs = {}   # per-key debounce timers, see _key_up()
+        self._bind_drive_keys(root)
         self._tick()
 
     # ---- distance ----
@@ -753,6 +763,82 @@ class App:
         # stop on leave too — a motor left running is worse than a jerky UI.
         b.bind("<Leave>", lambda e: self.link.send(stop_cmd))
 
+    def _toggle_forward(self):
+        if self.drive_state == 1:
+            self.link.send("S")
+            self.drive_state = 0
+        else:
+            self.link.send("F")
+            self.drive_state = 1
+        self._update_drive_buttons()
+
+    def _toggle_backward(self):
+        if self.drive_state == -1:
+            self.link.send("S")
+            self.drive_state = 0
+        else:
+            self.link.send("B")
+            self.drive_state = -1
+        self._update_drive_buttons()
+
+    def _update_drive_buttons(self):
+        # Highlight whichever direction is currently active so it's obvious
+        # at a glance the robot is still moving without watching the video.
+        self.fwd_btn.config(bg="#2d6b2d" if self.drive_state == 1 else "#d9d9d9",
+                            fg="white" if self.drive_state == 1 else "black")
+        self.back_btn.config(bg="#2d6b2d" if self.drive_state == -1 else "#d9d9d9",
+                             fg="white" if self.drive_state == -1 else "black")
+
+    # ---- keyboard drive: F/B keys, works ALONGSIDE the click-toggle
+    # buttons above (both just flip the same drive_state) ----
+    #
+    # Holding a key down on any OS does NOT deliver one continuous "key is
+    # down" signal to Tkinter -- the OS's own key-repeat fires a rapid
+    # alternating stream of KeyRelease/KeyPress events for as long as you
+    # hold it. A naive "release = stop" binding would therefore stutter:
+    # stop, restart, stop, restart, many times a second while held.
+    #
+    # Fix: on release, don't stop immediately -- schedule the stop after a
+    # short delay. If the key is actually still held, the next auto-repeat
+    # KeyPress arrives within that delay and cancels the pending stop. Only
+    # a GENUINE release (nothing arrives in time) lets the stop go through.
+    # A quick tap also works correctly: press moves, and since no repeat
+    # follows, the debounced stop fires almost immediately after.
+    _KEY_DEBOUNCE_MS = 60
+
+    def _bind_drive_keys(self, root):
+        root.bind("<KeyPress-f>", lambda e: self._key_down("f"))
+        root.bind("<KeyRelease-f>", lambda e: self._key_up("f"))
+        root.bind("<KeyPress-b>", lambda e: self._key_down("b"))
+        root.bind("<KeyRelease-b>", lambda e: self._key_up("b"))
+        root.focus_set()   # window must have keyboard focus to see these at all
+
+    def _key_down(self, key):
+        pending = self._release_jobs.pop(key, None)
+        if pending is not None:
+            self.root.after_cancel(pending)
+            return   # this was an auto-repeat press -- already moving, ignore
+        if key == "f" and self.drive_state != 1:
+            self.link.send("F")
+            self.drive_state = 1
+            self._update_drive_buttons()
+        elif key == "b" and self.drive_state != -1:
+            self.link.send("B")
+            self.drive_state = -1
+            self._update_drive_buttons()
+
+    def _key_up(self, key):
+        self._release_jobs[key] = self.root.after(
+            self._KEY_DEBOUNCE_MS, lambda: self._key_up_confirmed(key))
+
+    def _key_up_confirmed(self, key):
+        self._release_jobs.pop(key, None)
+        if (key == "f" and self.drive_state == 1) or \
+           (key == "b" and self.drive_state == -1):
+            self.link.send("S")
+            self.drive_state = 0
+            self._update_drive_buttons()
+
     def _on_led_scale(self, val):
         # Tk fires this for every pixel of drag, so only send on change —
         # otherwise a single sweep floods the port with dozens of characters
@@ -773,6 +859,8 @@ class App:
         """Panic button: stop drive AND actuator."""
         self.link.send("S")
         self.link.send("X")
+        self.drive_state = 0
+        self._update_drive_buttons()
 
     # ---- live diagnostics ----
     def _diag_numbers(self):
