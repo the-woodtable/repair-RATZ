@@ -148,6 +148,9 @@ bool writeWithTimeout(const uint8_t *data, size_t len, uint32_t timeout_ms) {
 void applyFixedImageSettings();   // defined below setup()
 
 void setup() {
+  // MUST equal CAM_BAUD in THIS ONE/include/StereoCameras.h.
+  // Changing it means reflashing BOTH cameras AND the S3 — three devices.
+  // Symptom of getting it wrong: telemetry still works, frames stay at 0.
   Serial.begin(460800);
 
   // Arm the task watchdog on the loop task. `true` panics (reboots) on

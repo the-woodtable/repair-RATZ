@@ -51,8 +51,119 @@ uint32_t lastTelemetry = 0;
 
 
 
+// ===========================================================================
+// EXPERIMENTAL: automated spool-retract sequence            press 'P' to run
+// ---------------------------------------------------------------------------
+// Drive forward a little -> turn the spool one round -> repeat, until the
+// string is wound in.
+//
+// TO TURN OFF: change the 1 below to 0. Nothing else needs touching.
+// TO DELETE:  remove this whole block plus the three short #if blocks marked
+//             "spool sequence" in setup(), loop() and the command switch.
+//
+// Existing 'T' and 'Y' spool keys are untouched and still work by hand.
+//
+// WHY A STATE MACHINE AND NOT delay():
+//   loop() must keep calling cameras.update(). A delay() here would stall
+//   camera forwarding for the whole sequence, overflow the UART buffers and
+//   bring back exactly the torn/truncated frames we spent days removing.
+//   So each step just records a timestamp and returns immediately.
+#define ENABLE_SPOOL_SEQUENCE 1
+
+#if ENABLE_SPOOL_SEQUENCE
+
+// THE SPOOL SERVO IS CONTINUOUS ROTATION. setAngle() therefore sets SPEED
+// AND DIRECTION, not a position:
+//     90  = stop
+//     180 = full speed one way
+//     0   = full speed the other way
+//     values in between = proportionally slower
+// So there is no "turn to X degrees" — you start it spinning, wait, and stop
+// it. How far it turns is speed x time, which is why SPOOL_SPIN_MS below has
+// to be measured rather than guessed.
+
+// ---- tune these ----
+static const uint8_t  SPOOL_CYCLES   = 6;    // how many drive+spin repeats
+static const uint32_t SPOOL_DRIVE_MS = 400;  // forward time per step
+static const int      SPOOL_SPIN     = 180;  // wind-in speed; 0 = other way
+static const int      SPOOL_STOP     = 90;   // servo neutral = stopped
+// TIME FOR ONE REVOLUTION — MEASURE THIS, don't guess. Mark the spool, press
+// 'T', time one full turn, press 'Y'. A typical continuous servo runs about
+// 50-60 rpm unloaded, so one turn is roughly 1000-1200 ms, and it gets slower
+// as the string load builds.
+static const uint32_t SPOOL_SPIN_MS  = 1000;
+static const int      SPOOL_DIR      = +1;   // +1 forward, -1 reverse
+// --------------------
+
+enum SpoolState : uint8_t { SPOOL_IDLE, SPOOL_DRIVING, SPOOL_SPINNING };
+static SpoolState spoolState = SPOOL_IDLE;
+static uint32_t   spoolT0    = 0;
+static uint8_t    spoolCycle = 0;
+
+static void spoolSeqAbort() {
+  if (spoolState == SPOOL_IDLE) return;
+  stepper.setDrive(0);                 // stop the motor FIRST
+  spoolServo.setAngle(SPOOL_STOP);     // 90 = stop, not "go to 90 degrees"
+  spoolState = SPOOL_IDLE;
+  Serial.println("{\"spool_seq\":0}");
+}
+
+static void spoolSeqStart() {
+  spoolCycle = 0;
+  spoolState = SPOOL_DRIVING;
+  spoolT0    = millis();
+  stepper.setDrive(SPOOL_DIR);
+  Serial.println("{\"spool_seq\":1}");
+}
+
+static void spoolSeqUpdate() {
+  if (spoolState == SPOOL_IDLE) return;
+  const uint32_t now = millis();
+
+  switch (spoolState) {
+    case SPOOL_DRIVING:
+      if (now - spoolT0 >= SPOOL_DRIVE_MS) {
+        stepper.setDrive(0);
+        spoolServo.setAngle(SPOOL_SPIN);   // START spinning
+        spoolT0 = now;
+        spoolState = SPOOL_SPINNING;
+      }
+      break;
+
+    case SPOOL_SPINNING:
+      if (now - spoolT0 >= SPOOL_SPIN_MS) {
+        spoolServo.setAngle(SPOOL_STOP);   // STOP spinning — one round done
+        if (++spoolCycle >= SPOOL_CYCLES) {
+          spoolState = SPOOL_IDLE;
+          Serial.println("{\"spool_seq\":0}");
+        } else {
+          stepper.setDrive(SPOOL_DIR);
+          spoolT0 = now;
+          spoolState = SPOOL_DRIVING;
+        }
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+#endif  // ENABLE_SPOOL_SEQUENCE
+// ===========================================================================
+
+
 void setup() {
-  Serial.begin(460800);
+  Serial.begin(576000);
+
+  // RESERVE LEDC TIMERS FOR THE SERVOS BEFORE ANY OF THEM ATTACH.
+  // ESP32Servo allocates channels dynamically and cannot see raw ledcSetup()
+  // calls made elsewhere, so it handed channel 0 to hookServo and actuator.cpp
+  // then reconfigured that same channel underneath it — which is why moving a
+  // servo drove the actuator and driving a motor moved a servo. Pinning the
+  // servos to timers 0 and 1 keeps them clear of the LED (timer 2) and the
+  // actuator (timer 3). See the channel map at the top of actuator.cpp.
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
 
   if (!hookServo.begin(PIN_SERVO, 180)) {
     Serial.println("ERROR: hook servo failed to attach!");
@@ -141,7 +252,19 @@ void loop() {
 
     //blink light if setup successful
 
+#if ENABLE_SPOOL_SEQUENCE
+    // spool sequence: ANY other key aborts a run in progress, so you never
+    // have to hunt for the right button to stop it. Checked BEFORE the
+    // switch so it applies to every command including STOP.
+    if (c != 'P') spoolSeqAbort();
+#endif
+
     switch (c) {
+
+#if ENABLE_SPOOL_SEQUENCE
+      // spool sequence: start the automated wind-in
+      case 'P': spoolSeqStart(); break;
+#endif
 
       //-- servo --
       case 'H': hookServo.setAngle(180); break;
@@ -181,7 +304,11 @@ void loop() {
   }
 
   actuator.update();
-  
+
+#if ENABLE_SPOOL_SEQUENCE
+  spoolSeqUpdate();   // spool sequence: advances one step, never blocks
+#endif
+
   if (millis() - lastTelemetry >= TELEM_INTERVAL_MS) {
      lastTelemetry = millis();
      sendTelemetry();

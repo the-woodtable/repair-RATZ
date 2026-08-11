@@ -343,20 +343,26 @@ class FrameLink:
             # Correct a rotated MOUNT here, once, before anything else sees
             # the frame — so display, recording, stills and calibration all
             # share one orientation.
-            deg = ROTATE_DEG[cam] % 360
-            if deg:
-                img = cv2.rotate(img, _ROTATE_FLAG[deg])
-            # Drop truncated captures instead of showing grey-bottom frames.
-            # The display then simply holds the last good image.
+            # ---- REJECT CORRUPT FRAMES *BEFORE* ROTATING ----
+            # Both detectors assume SENSOR orientation: JPEG damage always
+            # affects the tail of the image in scan order, i.e. the bottom
+            # rows. After a 90/270 rotation that tail becomes a vertical band
+            # on the left or right edge, so a bottom-rows test and a
+            # row-to-row seam test both look at the wrong axis and pass the
+            # corruption straight through. Checking first costs nothing and
+            # keeps the detectors honest whatever ROTATE_DEG is set to.
             if self._flat_bottom_frac(img) > MAX_FLAT_BOTTOM:
                 self.dropped += 1
                 self.drop_flat += 1
                 continue
-            # Reject frames with a hard colour-band edge (bitstream error).
             if self._colour_band_jump(img) > MAX_COLOUR_JUMP:
                 self.dropped += 1
                 self.drop_band += 1
                 continue
+
+            deg = ROTATE_DEG[cam] % 360
+            if deg:
+                img = cv2.rotate(img, _ROTATE_FLAG[deg])
             # Cheap per-camera image stats so the panel can show whether the
             # two cameras are exposed the same (needed for stereo matching).
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)

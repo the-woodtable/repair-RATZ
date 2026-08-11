@@ -43,6 +43,20 @@
 
 class StereoCameras {
 public:
+  // ===================================================================
+  // CHANGING THIS MEANS FLASHING **THREE** DEVICES, NOT TWO:
+  //     1. left camera    (camera_firmware.ino)
+  //     2. right camera   (camera_firmware.ino)
+  //     3. this S3        (PlatformIO)
+  // Miss any one and the symptom is always the same and always confusing:
+  // TELEMETRY KEEPS WORKING (it goes S3->laptop over USB) while frame
+  // counts sit at zero. If you see that combination, check these two
+  // numbers before anything else.
+  //
+  // 460800 is the proven-good value — weeks of clean streaming.
+  // 921600 doubles the bandwidth but the left channel's wiring is
+  // marginal at that speed; fix the grounding before trying it again.
+  // ===================================================================
   static const uint32_t CAM_BAUD = 460800;   // MUST equal Serial.begin() in
                                              // camera_firmware.ino. Change one,
                                              // change the other, reflash BOTH.

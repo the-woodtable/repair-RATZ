@@ -176,7 +176,9 @@ GEO = {
     "pos_assembly": QRect(744, 784,  134,  59),
     "pos_deploy":   QRect(885, 750,   59, 134),
 
-    # "status":       QRect(0,   900, 1280,  48),
+    # Kept even when SHOW_STATUS is False - the widget is just hidden, and
+    # _build_status still needs somewhere to put it.
+    "status":       QRect(0,   906, 1280,  48),   # clears the spool at y=905
 }
 
 TITLE_TEXT = "repair rat #64"
@@ -230,6 +232,34 @@ HOOK_BOOT = "H"
 # ---------------------------------------------------------------------------
 LINING = ("R", "D", "compressed", "deployed", False)
 SPOOL = ("Y", "T", "string out", "wound in", False)
+
+# ---------------------------------------------------------------------------
+# THE LAMP
+#
+# There is no on/off button in the artwork, so this lives on the keyboard:
+#     L        toggle on / off        ('L' = led.on(), 'O' = led.off())
+#     = or +   one step brighter      sends '0'-'9'
+#     - or _   one step dimmer
+#
+# LED::begin() (src/LED.cpp) sets _state = false and _bright = 255, so the
+# lamp boots OFF with full brightness remembered - hence the slider starting
+# at 9 while the status line reads "off".
+#
+# The catch: LED::setBrightness does `_state = (b > 0)`, so sending any digit
+# also switches the lamp ON, and sending '0' switches it OFF. Moving the
+# slider is therefore an on/off command as well as a level, and on_led has to
+# mirror that or the panel's idea of the lamp goes stale.
+# ---------------------------------------------------------------------------
+LED_ON, LED_OFF = "L", "O"
+LED_BOOT_ON = False        # LED::begin -> _state = false
+LED_BOOT_LEVEL = 9         # LED::begin -> _bright = 255, which is '9'
+
+# The diagnostic strip along the bottom. Off for the showcase, on when you are
+# debugging - it reports link state, fps, every position, the lamp, the last
+# character sent, crack count and distance, and the telemetry echo.
+# Prefer flipping this to commenting the code out: closeEvent lives in the same
+# block, and without it the drive motor keeps running after the window shuts.
+SHOW_STATUS = False
 
 C_BG        = QColor("#E4E2DD")
 C_INK       = QColor("#1B4EA0")
@@ -864,6 +894,9 @@ class Panel(QWidget):
         self.hook_pos = HOOK_BOOT    # HookServo::begin parks at 180 == 'H'
         self.act_until = 0.0
         self.act_dir = ""
+        # LED::begin() leaves the lamp off with full brightness remembered, so
+        # the slider sits at 9 while the lamp reads "off". Both are true.
+        self.led_on = LED_BOOT_ON
         self._led_last = None
         self._last_cmd = "-"
         self._telem = {}
@@ -890,15 +923,15 @@ class Panel(QWidget):
         self._build_background()
         self._build_video()
         self._build_controls()
-        # self._build_status()
+        self._build_status()
 
         link.frame_ready.connect(self.on_frame)
         link.telemetry.connect(self.on_telemetry)
         link.link_state.connect(self._set_link_text)
 
-        # self.ticker = QTimer(self)
-        # self.ticker.timeout.connect(self.refresh_status)
-        # self.ticker.start(200)
+        self.ticker = QTimer(self)
+        self.ticker.timeout.connect(self.refresh_status)
+        self.ticker.start(200)
 
     # -- geometry ----------------------------------------------------------
     def g(self, key: str) -> QRect:
@@ -1023,17 +1056,21 @@ class Panel(QWidget):
         groove = load("groove", QSize(self.px(104), self.px(330)))
         # Firmware maps the characters '0'-'9' onto 0-255, so the slider is 0-9
         # and one character carries the level.
-        self.slider = ImageSlider(handle, groove, G("slider"), 0, 9, self)
+        self.slider = ImageSlider(handle, groove, G("slider"), 0, LED_BOOT_LEVEL,
+                                  self)
         self.slider.setToolTip("Lamp brightness (0 bottom - 9 top)")
         self.slider.valueChanged.connect(self.on_led)
 
-    # def _build_status(self):
-    #     self.status = QLabel(self)
-    #     self.status.setGeometry(self.g("status"))
-    #     self.status.setAlignment(Qt.AlignCenter)
-    #     self.status.setStyleSheet(
-    #         f"color:{C_INK.name()}; font-family:Menlo,Consolas,monospace;"
-    #         f"font-size:{self.px(11)}px; background:transparent;")
+    def _build_status(self):
+        """The diagnostic strip along the bottom. SHOW_STATUS turns it off for
+        the showcase; everything behind it keeps running either way."""
+        self.status = QLabel(self)
+        self.status.setGeometry(self.g("status"))
+        self.status.setAlignment(Qt.AlignCenter)
+        self.status.setStyleSheet(
+            f"color:{C_INK.name()}; font-family:Menlo,Consolas,monospace;"
+            f"font-size:{self.px(11)}px; background:transparent;")
+        self.status.setVisible(SHOW_STATUS)
 
     # -- commands ----------------------------------------------------------
     def send(self, ch: str):
@@ -1088,6 +1125,21 @@ class Panel(QWidget):
         if v != self._led_last:
             self._led_last = v
             self.send(str(v))
+            # LED::setBrightness does _state = (b > 0), so the digit we just
+            # sent has also switched the lamp on (or off, at 0). Mirror it.
+            self.led_on = v > 0
+
+    def toggle_led(self):
+        """L key. LED::on() restores the last brightness, so the slider
+        position stays meaningful across an off/on cycle."""
+        self.led_on = not self.led_on
+        self.send(LED_ON if self.led_on else LED_OFF)
+
+    def nudge_lamp(self, delta: int):
+        """= and - keys. Moves the slider, which emits valueChanged and so
+        goes through on_led - one path to the wire, same as the mouse."""
+        lo, hi = self.slider.minimum(), self.slider.maximum()
+        self.slider.setValue(min(hi, max(lo, self.slider.value() + delta)))
 
     def stop_all(self):
         """Panic: stop the drive and cut the lining actuator.
@@ -1126,6 +1178,12 @@ class Panel(QWidget):
             self.spool.set(True)
         elif e.text().upper() == SPOOL[0]:       # Y - pay out
             self.spool.set(False)
+        elif e.text().upper() == LED_ON:         # L - lamp on/off
+            self.toggle_led()
+        elif e.text() in ("=", "+"):             # brighter
+            self.nudge_lamp(+1)
+        elif e.text() in ("-", "_"):             # dimmer
+            self.nudge_lamp(-1)
         elif k == Qt.Key_Escape:
             self.close()
 
@@ -1190,47 +1248,59 @@ class Panel(QWidget):
     def _set_link_text(self, t: str):
         self.link_text = t
 
-    # def refresh_status(self):
-    #     now = time.time()
-    #     age = now - self._telem_seen
-    #     tel = "  ".join(f"{k}={v}" for k, v in list(self._telem.items())[:4]) \
-    #         if self._telem and age < 3 else "telemetry: none"
-    #     # The countdown only describes the motor. The button keeps showing the
-    #     # state you commanded, because that is where the lining ended up.
-    #     if now < self.act_until:
-    #         motor = f" ({self.act_dir} {self.act_until - now:3.1f}s)"
-    #     elif self.act_dir == "stopped":
-    #         motor = " (stopped)"
-    #     else:
-    #         motor = ""
+    def refresh_status(self):
+        """Recompute the status strip. Still worth running when the strip is
+        hidden: this is the only place the actuator countdown ages out."""
+        now = time.time()
+        age = now - self._telem_seen
+        tel = "  ".join(f"{k}={v}" for k, v in list(self._telem.items())[:4]) \
+            if self._telem and age < 3 else "telemetry: none"
+        # The countdown only describes the motor. The button keeps showing the
+        # state you commanded, because that is where the lining ended up.
+        if now < self.act_until:
+            motor = f" ({self.act_dir} {self.act_until - now:3.1f}s)"
+        elif self.act_dir == "stopped":
+            motor = " (stopped)"
+        else:
+            motor = ""
 
-    #     if self.cv_note:
-    #         cv_txt = self.cv_note
-    #     elif self.cv:
-    #         _, infer_ms, depth_ms = self.cv.latest()
-    #         near = f"{self._nearest / 10.0:.1f}cm" if self._nearest else "--"
-    #         cv_txt = (f"cracks={self._det_count} nearest={near} "
-    #                   f"yolo={infer_ms:.0f}ms sgbm={depth_ms:.0f}ms")
-    #     else:
-    #         cv_txt = "cv off"
+        if not SHOW_STATUS:
+            return
 
-    #     self.status.setText(
-    #         f"{self.link_text}   L {self.link.fps['L']:4.1f}fps   "
-    #         f"R {self.link.fps['R']:4.1f}fps   "
-    #         f"hook={HOOK_LABEL.get(self.hook_pos, '?')}   "
-    #         f"lining={self.lining.label()}{motor}   "
-    #         f"spool={self.spool.label()}   "
-    #         f"lamp={self.slider.value()}   sent={self._last_cmd}\n"
-    #         f"{cv_txt}   {tel}     "
-    #         f"[{'/'.join(HOOK_LABEL)}]=hook  [D/R]=lining  [T/Y]=spool  "
-    #         "[space]=stop all  [esc]=quit")
+        if self.cv_note:
+            cv_txt = self.cv_note
+        elif self.cv:
+            _, infer_ms, depth_ms = self.cv.latest()
+            near = f"{self._nearest / 10.0:.1f}cm" if self._nearest else "--"
+            cv_txt = (f"cracks={self._det_count} nearest={near} "
+                      f"yolo={infer_ms:.0f}ms sgbm={depth_ms:.0f}ms")
+        else:
+            cv_txt = "cv off"
 
-    # def closeEvent(self, e):
-    #     self.ticker.stop()
-    #     if self.cv:
-    #         self.cv.stop()
-    #     self.link.stop()
-    #     super().closeEvent(e)
+        # Level and on/off are independent in firmware, so show both rather
+        # than letting "9" imply the lamp is lit.
+        lamp = (f"{self.slider.value()}" if self.led_on
+                else f"off ({self.slider.value()})")
+
+        self.status.setText(
+            f"{self.link_text}   L {self.link.fps['L']:4.1f}fps   "
+            f"R {self.link.fps['R']:4.1f}fps   "
+            f"hook={HOOK_LABEL.get(self.hook_pos, '?')}   "
+            f"lining={self.lining.label()}{motor}   "
+            f"spool={self.spool.label()}   "
+            f"lamp={lamp}   sent={self._last_cmd}\n"
+            f"{cv_txt}   {tel}     "
+            f"[{'/'.join(HOOK_LABEL)}]=hook  [D/R]=lining  [T/Y]=spool  "
+            "[L]=lamp  [-/=]=bright  [space]=stop  [esc]=quit")
+
+    def closeEvent(self, e):
+        """Runs whether or not the status strip is shown. Without it the drive
+        motor keeps running after the window shuts: link.stop() sends S and X."""
+        self.ticker.stop()
+        if self.cv:
+            self.cv.stop()
+        self.link.stop()
+        super().closeEvent(e)
 
 
 # ---------------------------------------------------------------------------
