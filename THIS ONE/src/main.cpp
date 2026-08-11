@@ -29,7 +29,7 @@ int PIN_ACT_STBY = 10;   // TB6612 STBY — set to your actual pin
 // them: (90, 270) -> (270, 90) in all four Python files.
 int CAML_RX = 18;   // left cam U0T  -> S3 GPIO 18
 int CAMR_RX = 16;   // right cam U0T -> S3 GPIO 16
- 
+
 int PIN_SDA = 13;
 int PIN_SCL = 14;
 
@@ -40,26 +40,29 @@ HookServo hookServo;
 HookServo spoolServo;
 Stepper stepper;
 Actuator actuator;
-StereoCameras cameras; 
+StereoCameras cameras;
 IMU imu;
 LED led;
 
 //STEPPER VARIABLES
 int STEP_HZ = 100;
 
- 
+// Calibrated in the pipe with the robot fully assembled, 7 runs from
+// 32cm-73cm each. Weighted average (total steps / total distance):
+// 12925 steps / 4012mm = 3.222. Individual run ratios ranged 3.13-3.31,
+// no outliers discarded. Re-calibrate if wheels, gearing, or the pipe
+// surface change (this is a real physical measurement, not derived from
+// geometry, since wheel slip/preload can't be computed reliably).
+float STEPS_PER_MM = 3.222f;
+
 //ACTUATOR VARIABLES
-int ACT_SPEED = 255;   // 0-255, default speed for jog commands
- 
+int ACT_SPEED = 100;   // 0-255, default speed for jog commands
 
 //OTHER VARIABLES
 bool setupSuccessful = true;
 
 const uint32_t TELEM_INTERVAL_MS = 200;   // 5 Hz
 uint32_t lastTelemetry = 0;
-
-
-
 
 
 void setup() {
@@ -93,9 +96,9 @@ void setup() {
     Serial.println("ERROR: actuator failed to attach!");
     setupSuccessful = false;
   }
-    if (!cameras.begin(CAML_RX, -1, CAMR_RX, -1)) { 
+    if (!cameras.begin(CAML_RX, -1, CAMR_RX, -1)) {
     Serial.println("ERROR: camera buffers failed to attach!");
-    setupSuccessful = false; 
+    setupSuccessful = false;
 
   } if (!imu.begin(PIN_SDA, PIN_SCL)) {
   Serial.println("ERROR: IMU not found!");
@@ -142,8 +145,8 @@ void setup() {
       delay(500);
     }
   }
-  
-  
+
+
 }
 void sendTelemetry() {
   Serial.print("{\"servo_angle\":");
@@ -151,10 +154,13 @@ void sendTelemetry() {
 
   Serial.print("{\"steps\":");
   Serial.print(stepper.getStepCount());
-  
+
+  Serial.print("{\"pos_mm\":");
+  Serial.print(stepper.getStepCount() / STEPS_PER_MM, 1);
+
   Serial.print("{\"stepper_drive_dir\":");
   Serial.print(stepper.getDrive());
-  
+
   Serial.print("{\"actuator\":");
   Serial.print(actuator.getState());
 
@@ -163,10 +169,10 @@ void sendTelemetry() {
 
   Serial.print("{\"imu_vel\":");
   Serial.print(imu.getVelocity());
-  
+
   Serial.print("{\"imu_bias\":");
   Serial.print(imu.getBias());
-  
+
   Serial.print("{\"slip\":");
   Serial.print(imu.isSlipping());
 
@@ -200,7 +206,7 @@ void loop() {
       case 'F': stepper.setDrive(+1); break;
       case 'B': stepper.setDrive(-1); break;
       case 'S': stepper.setDrive(0);  break;
-      
+
       // -- actuator --
       case 'D': actuator.extend(ACT_SPEED);  break;  // deploy
       case 'R': actuator.retract(ACT_SPEED); break;  // retract
@@ -232,4 +238,3 @@ void loop() {
      sendTelemetry();
   }
 }
-

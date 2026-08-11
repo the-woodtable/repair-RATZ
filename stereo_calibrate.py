@@ -1,19 +1,29 @@
 """
-EDI PIPE CAM — stereo calibration
----------------------------------
+EDI PIPE CAM — stereo calibration (FISHEYE lens version)
+---------------------------------------------------------
 Run ONCE after both cameras are rigidly mounted. If a camera is ever
 remounted or bumped, recalibrate.
 
     pip install pyserial opencv-python numpy
     python stereo_calibrate.py
 
-Needs a printed checkerboard (default 9x6 INNER corners, 25 mm squares —
+Needs a printed checkerboard (default 10x7 INNER corners, 19.5 mm squares —
 edit below to match yours; measure the printed square size!).
+
+WHY FISHEYE, NOT THE STANDARD MODEL:
+Your camera lenses are wide-angle (120-160 degree class). The standard
+pinhole model (cv2.calibrateCamera / cv2.stereoCalibrate) assumes mild,
+low-order lens distortion and does NOT fit a lens this wide well,
+especially toward the frame edges -- you can get a deceptively low
+reported RMS error while the actual rectification is still warped or
+misaligned. cv2.fisheye.* uses a distortion model designed for this.
 
 Keys (with the preview window focused):
     SPACE  capture a pair (hold the board still, visible in BOTH views)
-    c      calibrate using captured pairs (need >= 10, from varied
-           angles/distances) and save stereo_calib.npz
+    c      calibrate using captured pairs (need >= 15 for fisheye -- it
+           has more distortion parameters to fit than the standard model,
+           so it needs more views, from varied angles/distances) and
+           save stereo_calib.npz
     q      quit
 """
 
@@ -23,11 +33,12 @@ import time
 import cv2
 import numpy as np
 import serial
+import serial.tools.list_ports
 
 from stereo_serial import TaggedFrameReader
 
 # ------------------- Settings -------------------
-PORT = None               # None = auto-detect; or set e.g. "/dev/cu.usbmodem101"
+PORT = None               # None = auto-detect (cross-platform, by VID); or force e.g. "COM7"
 BAUD = 921600
 # INNER corners, not squares: an 11x8 square board has 10x7 inner corners
 # (the crossings where four squares meet — the outer edges don't count).
@@ -38,31 +49,20 @@ BOARD = (10, 7)           # inner corners (cols, rows) — 11x8 square board
 # SETS THE SCALE OF EVERY DISTANCE YOU WILL EVER MEASURE. Measure a printed
 # square with a ruler; don't trust what the PDF claimed, printers rescale.
 # If this is wrong by 10%, every reported distance is wrong by 10%.
-# Self-check: the baseline this script prints must match a ruler measurement
-# of the gap between your two lenses. If it doesn't, this number is why.
-# 19.5 measured with a ruler on the actual printout. The first run used 15.0
-# and produced a 95.9 mm baseline for a rig whose lenses are 125 mm apart —
-# wrong by exactly 19.5/15.0. That is the self-check working.
 SQUARE_MM = 19.5          # printed square size in mm — MEASURE IT
 OUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "stereo_calib.npz")
 
-# How much image to keep when rectifying. This matters a lot when the two
-# cameras are NOT well aligned — which ours are not, being bonded 180 degrees
-# apart with a few degrees of residual roll.
-#
-#   0.0  crop to only fully-valid pixels. No black borders, but a badly
-#        aligned pair loses a LOT of field of view to the crop.
-#   1.0  keep every pixel. Nothing is thrown away, but the edges have black
-#        wedges where one camera had no data.
-#   0.5  a middle ground: most of the view, modest borders.
-#
-# We were on 0.0, which is why the effective FOV came out much narrower than
-# the 120-degree lenses should give. Black borders are harmless for viewing —
-# SGBM simply finds no match there and reports no distance, exactly as it
-# would off the edge of the frame.
-RECTIFY_ALPHA = 0.5
+# Fisheye calibration needs more views than the standard model (more
+# distortion parameters to fit reliably). 15 is a practical floor;
+# more, and more varied, is always better.
+MIN_PAIRS = 15
 
+# How much image to keep when rectifying, fisheye's equivalent of the
+# standard model's alpha. 0.0 = crop to only fully-valid pixels (narrower
+# effective FOV, no black borders). 1.0 = keep every pixel (full FOV, black
+# wedges where one camera had no data). 0.5 is a middle ground.
+BALANCE = 0.5
 
 # MUST match ROTATE_DEG in control_panel_stereo2.py — (left, right).
 # Calibration describes the images as the panel will see them; if the two
@@ -138,13 +138,51 @@ def decode(jpeg, cam):
 
 
 def find_port():
+    """Pick the S3's own native USB port, on any OS.
+
+    Matches by VID (USB vendor ID), not by device name string -- device
+    names differ by OS (COM7 on Windows, /dev/cu.usbmodem101 on Mac,
+    /dev/ttyACM0 on Linux) but the VID is a property of the USB hardware
+    itself and is identical everywhere.
+
+    0x303A = Espressif's own vendor ID -- the S3's NATIVE USB CDC/JTAG.
+    Common USB-serial ADAPTER chips (what you flash the cameras through,
+    not the S3 itself): CH340 = 0x1A86, FTDI = 0x0403, CP210x = 0x10C4.
+    """
     if PORT:
         return PORT
-    from serial.tools import list_ports
-    candidates = [p.device for p in list_ports.comports()
-                  if any(k in p.device.lower()
-                         for k in ("usbmodem", "usbserial", "ttyacm", "ttyusb"))]
-    return candidates[0] if candidates else None
+
+    ESPRESSIF_VID = 0x303A
+    ADAPTER_VIDS = {0x1A86, 0x0403, 0x10C4}
+
+    ports = list(serial.tools.list_ports.comports())
+    native = [p.device for p in ports if p.vid == ESPRESSIF_VID]
+    adapter = [p.device for p in ports if p.vid in ADAPTER_VIDS]
+
+    if not native and not adapter:
+        return None
+    if not native:
+        print("No native Espressif USB port -- the S3 may not be plugged in.")
+        print(f"Falling back to the USB-serial adapter {adapter[0]}. If you "
+              "are trying to FLASH a camera, close this panel first.")
+        return adapter[0]
+    if len(native) > 1 or adapter:
+        print("Serial devices seen:", ", ".join(p.device for p in ports))
+        print(f"Using {native[0]} — set PORT at the top to override.")
+    return native[0]
+
+
+def _to_fisheye_points(obj_pts, pts_l, pts_r):
+    """cv2.fisheye.* wants each view's points as float64 arrays shaped
+    (1, N, 3) for object points and (1, N, 2) for image points -- NOT the
+    (N, 1, 3)/(N, 1, 2) shape cv2.calibrateCamera and findChessboardCorners
+    give you. Reshape here once rather than getting cryptic assertion
+    errors deep inside OpenCV's C++ layer."""
+    n = BOARD[0] * BOARD[1]
+    obj_fe = [o.reshape(1, n, 3).astype(np.float64) for o in obj_pts]
+    l_fe = [p.reshape(1, n, 2).astype(np.float64) for p in pts_l]
+    r_fe = [p.reshape(1, n, 2).astype(np.float64) for p in pts_r]
+    return obj_fe, l_fe, r_fe
 
 
 def main():
@@ -224,27 +262,65 @@ def main():
                 print("checkerboard not found in both views — adjust and retry")
 
         elif key == ord("c"):
-            if len(obj_pts) < 10:
-                print(f"only {len(obj_pts)} pairs — capture at least 10")
+            if len(obj_pts) < MIN_PAIRS:
+                print(f"only {len(obj_pts)} pairs — fisheye needs at least "
+                      f"{MIN_PAIRS}, from varied angles/distances")
                 continue
-            print("calibrating...")
-            _, k1, d1, _, _ = cv2.calibrateCamera(obj_pts, pts_l, img_size, None, None)
-            _, k2, d2, _, _ = cv2.calibrateCamera(obj_pts, pts_r, img_size, None, None)
-            rms, k1, d1, k2, d2, r, t, _, _ = cv2.stereoCalibrate(
-                obj_pts, pts_l, pts_r, k1, d1, k2, d2, img_size,
-                flags=cv2.CALIB_FIX_INTRINSIC)
+            print("calibrating (fisheye model)...")
+
+            obj_fe, l_fe, r_fe = _to_fisheye_points(obj_pts, pts_l, pts_r)
+
+            # Not every opencv-python build exposes all three constants under
+            # cv2.fisheye (varies by version/build) -- look each up
+            # defensively instead of assuming, so a missing one degrades
+            # gracefully (flag just isn't set) rather than crashing.
+            fe_flags = 0
+            for name in ("CALIB_RECOMPUTE_EXTRINSIC", "CALIB_CHECK_COND",
+                        "CALIB_FIX_SKEW"):
+                fe_flags |= getattr(cv2.fisheye, name, 0)
+            crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+                    100, 1e-6)
+
+            k1 = np.zeros((3, 3))
+            d1 = np.zeros((4, 1))
+            k2 = np.zeros((3, 3))
+            d2 = np.zeros((4, 1))
+            try:
+                _, k1, d1, _, _ = cv2.fisheye.calibrate(
+                    obj_fe, l_fe, img_size, k1, d1, flags=fe_flags,
+                    criteria=crit)
+                _, k2, d2, _, _ = cv2.fisheye.calibrate(
+                    obj_fe, r_fe, img_size, k2, d2, flags=fe_flags,
+                    criteria=crit)
+            except cv2.error as e:
+                print(f"fisheye single-camera calibration failed: {e}")
+                print("Usually means one or more captured pairs has a bad "
+                      "corner detection (board too tilted/close to the "
+                      "extreme edge). Try discarding recent captures and "
+                      "recapturing from more moderate angles.")
+                continue
+
+            try:
+                rms, k1, k2, d1, d2, r, t = cv2.fisheye.stereoCalibrate(
+                    obj_fe, l_fe, r_fe, k1, d1, k2, d2, img_size,
+                    flags=getattr(cv2.fisheye, "CALIB_FIX_INTRINSIC", 0),
+                    criteria=crit)
+            except cv2.error as e:
+                print(f"fisheye stereo calibration failed: {e}")
+                continue
+
             baseline = float(np.linalg.norm(t))
             print(f"RMS error: {rms:.3f} px (want < ~0.5)")
             print(f"baseline: {baseline:.1f} mm (sanity-check against ruler!)")
 
             # Precompute the rectification maps so the panel can just load
             # and use them (it must not have to redo stereoRectify).
-            r1, r2, p1, p2, _, _, _ = cv2.stereoRectify(
+            r1, r2, p1, p2, _ = cv2.fisheye.stereoRectify(
                 k1, d1, k2, d2, img_size, r, t,
-                flags=cv2.CALIB_ZERO_DISPARITY, alpha=RECTIFY_ALPHA)
-            map1x, map1y = cv2.initUndistortRectifyMap(
+                flags=cv2.CALIB_ZERO_DISPARITY, balance=BALANCE, fov_scale=1.0)
+            map1x, map1y = cv2.fisheye.initUndistortRectifyMap(
                 k1, d1, r1, p1, img_size, cv2.CV_32FC1)
-            map2x, map2y = cv2.initUndistortRectifyMap(
+            map2x, map2y = cv2.fisheye.initUndistortRectifyMap(
                 k2, d2, r2, p2, img_size, cv2.CV_32FC1)
             fx = float(p1[0, 0])          # rectified focal length, pixels
 
@@ -266,17 +342,21 @@ def main():
             print("A rectification check window opened. Pick any feature and "
                   "confirm it is on the same green line in both halves.")
             print("Black borders are normal: that is the misalignment being "
-                  f"corrected. Raise RECTIFY_ALPHA (now {RECTIFY_ALPHA}) to "
-                  "keep more image, lower it toward 0 to crop them away.")
+                  f"corrected. Raise BALANCE (now {BALANCE}) to keep more "
+                  "image, lower it toward 0 to crop them away.")
 
             np.savez(OUT_FILE,
                      # raw calibration (kept for reference / recomputation)
                      K1=k1, D1=d1, K2=k2, D2=d2, R=r, T=t,
                      image_size=np.array(img_size),
+                     model="fisheye",     # so future tooling can tell at a glance
                      # ready-to-use rectification + depth constants
+                     # (SAME KEY NAMES as the standard-model version, so
+                     # control_panel_stereo2.py's StereoCalib class needs
+                     # no changes at all)
                      map1x=map1x, map1y=map1y, map2x=map2x, map2y=map2y,
                      fx=fx, baseline=baseline, rms=float(rms))
-            print(f"saved {OUT_FILE} — put it next to control_panel_stereo.py")
+            print(f"saved {OUT_FILE} — put it next to control_panel_stereo2.py")
 
         elif key == ord("q"):
             break

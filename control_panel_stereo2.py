@@ -575,6 +575,17 @@ class App:
         self.lbl_dist = tk.Label(body, text="distance: --", bg="#1e1e1e",
                                  fg="#ff0", font=("Menlo", 15, "bold"))
         self.lbl_dist.pack()
+
+        # How far the ROBOT has traveled (from telemetry's pos_mm, i.e.
+        # steps / STEPS_PER_MM on the firmware) -- deliberately separate
+        # from lbl_dist above, which is the crack-to-camera distance.
+        # Made large/bold/cyan specifically so it's easy to spot at a
+        # glance while driving, unlike the small diagnostics text below.
+        self.lbl_traveled = tk.Label(body, text="DISTANCE TRAVELED: -- cm",
+                                     bg="#1e1e1e", fg="#0ff",
+                                     font=("Menlo", 22, "bold"))
+        self.lbl_traveled.pack(pady=(4, 8))
+
         self.lbl_status = tk.Label(body, text="", bg="#1e1e1e", fg="#0f0")
         self.lbl_status.pack()
 
@@ -1001,8 +1012,11 @@ class App:
             if disp is not None:
                 dm = self.calib.distance_mm(disp, cx, cy)
                 if dm:
-                    dist_txt = f"{dm / 10:.1f} cm"
-            label_txt = f"{tag} ID{det.track_id} {det.label} {det.conf:.2f}"
+                    dist_txt = f"{dm / 10:.1f}cm"
+            # On-screen label: just the class name + distance to THIS crack,
+            # no ID/confidence clutter. ID and confidence still go into
+            # cv_lines below for the text panel, in case they're useful there.
+            label_txt = f"{det.label} {dist_txt}"
             (tw_, th_), _ = cv2.getTextSize(label_txt,
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             x1, y1 = pts[:, 0].min(), pts[:, 1].min()
@@ -1083,6 +1097,14 @@ class App:
                        [k for k in t if k not in order]
                 self.lbl_telem.config(
                     text="  ".join(f"{k}={t[k]}" for k in keys), fg="#8f8")
+                if "pos_mm" in t:
+                    self.lbl_traveled.config(
+                        text=f"DISTANCE TRAVELED: {t['pos_mm'] / 10:.1f} cm")
+                elif "steps" in t:
+                    # Older firmware without pos_mm yet -- show raw steps
+                    # rather than nothing, so this still means something.
+                    self.lbl_traveled.config(
+                        text=f"DISTANCE TRAVELED: {t['steps']} steps (raw)")
             else:
                 self.lbl_telem.config(
                     text="telemetry: none received — S3 not sending?", fg="#e8a33d")
