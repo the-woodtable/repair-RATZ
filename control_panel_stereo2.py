@@ -433,7 +433,7 @@ class StereoCalib:
             self.fx = float(d["fx"])
             self.baseline = float(d["baseline"])       # mm
             self.sgbm = cv2.StereoSGBM_create(
-                minDisparity=0, numDisparities=128, blockSize=7,
+                minDisparity=0, numDisparities=256, blockSize=7,
                 P1=8 * 49, P2=32 * 49, uniquenessRatio=10,
                 speckleWindowSize=100, speckleRange=2, disp12MaxDiff=1)
             self.ok = True
