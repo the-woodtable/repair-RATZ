@@ -157,7 +157,7 @@ void setup() {
   // of VGA's data size.
   // INVALIDATES stereo_calib.npz (computed for the old 320x240 size) --
   // recalibrate with stereo_calibrate.py after reflashing BOTH cameras.
-  config.frame_size = FRAMESIZE_CIF;   // 400x296
+  config.frame_size = FRAMESIZE_SVGA;   // 400x296
 
   if (psramFound()) {
     // Lowered from 20 (less compression, more detail).
