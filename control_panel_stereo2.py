@@ -43,7 +43,7 @@ from crack_tracker import CrackTracker
 # ============================ CONFIG ============================
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-PORT   = None          # None = auto-detect, or "/dev/cu.usbmodem101"
+PORT   = None          # None = auto-detect (cross-platform, by VID), or force e.g. "COM7"
 BAUD   = 921600        # ignored by USB CDC but pyserial requires it
 SCALE  = 2             # display zoom (320x240 -> 640x480)
 
@@ -70,7 +70,7 @@ MAX_COLOUR_JUMP = 45.0
 
 # Crack/hole detection model. Set to your trained weights path.
 CV_MODEL_PATH = os.path.join(HERE, "CV.pt")
-CV_CONF = 0.4
+CV_CONF = 0.2
 
 # Rotation applied to each camera on arrival: 0, 90, 180 or 270 clockwise.
 # PER CAMERA, because the two are not necessarily mounted the same way —
@@ -97,29 +97,36 @@ _ROTATE_FLAG = {90: cv2.ROTATE_90_CLOCKWISE,
 
 # ============================ SERIAL ============================
 def find_port():
-    """Pick the S3's own USB port, never a USB-serial adapter.
+    """Pick the S3's own native USB port, on any OS.
 
-    The S3 enumerates as native USB CDC -> /dev/cu.usbmodem* (or ttyACM*).
-    A CH340/FTDI adapter -> /dev/cu.usbserial* (or ttyUSB*), and that is what
-    you flash the CAMERAS through. Preferring usbmodem stops this panel from
-    holding the programmer, which shows up as esptool saying "port is busy".
+    Matches by VID (USB vendor ID), not by device name string -- device
+    names differ by OS (COM7 on Windows, /dev/cu.usbmodem101 on Mac,
+    /dev/ttyACM0 on Linux) but the VID is a property of the USB hardware
+    itself and is identical everywhere.
+
+    0x303A = Espressif's own vendor ID -- the S3's NATIVE USB CDC/JTAG.
+    Common USB-serial ADAPTER chips (what you flash the cameras through,
+    not the S3 itself): CH340 = 0x1A86, FTDI = 0x0403, CP210x = 0x10C4.
     """
     if PORT:
         return PORT
-    ports = [p.device for p in serial.tools.list_ports.comports()]
-    native = [d for d in ports
-              if any(k in d.lower() for k in ("usbmodem", "ttyacm"))]
-    adapter = [d for d in ports
-               if any(k in d.lower() for k in ("usbserial", "ttyusb"))]
+
+    ESPRESSIF_VID = 0x303A
+    ADAPTER_VIDS = {0x1A86, 0x0403, 0x10C4}
+
+    ports = list(serial.tools.list_ports.comports())
+    native = [p.device for p in ports if p.vid == ESPRESSIF_VID]
+    adapter = [p.device for p in ports if p.vid in ADAPTER_VIDS]
+
     if not native and not adapter:
         return None
     if not native:
-        print("No usbmodem port — the S3 may not be plugged in.")
+        print("No native Espressif USB port -- the S3 may not be plugged in.")
         print(f"Falling back to the USB-serial adapter {adapter[0]}. If you "
               "are trying to FLASH a camera, close this panel first.")
         return adapter[0]
     if len(native) > 1 or adapter:
-        print("Serial devices seen:", ", ".join(ports))
+        print("Serial devices seen:", ", ".join(p.device for p in ports))
         print(f"Using {native[0]} — set PORT at the top to override.")
     return native[0]
 
@@ -407,27 +414,8 @@ class StereoCalib:
             self.map2x, self.map2y = d["map2x"], d["map2y"]
             self.fx = float(d["fx"])
             self.baseline = float(d["baseline"])       # mm
-            # numDisparities sets how far SGBM searches sideways for a match,
-            # and therefore the CLOSEST distance measurable:
-            #     nearest_mm = fx * baseline / numDisparities
-            # With fx 385 px and a 125 mm baseline: 64 -> 75 cm, 128 -> 38 cm.
-            # Too low and near objects are not merely missed — SGBM settles on
-            # a small wrong disparity and reports a confidently wrong LARGE
-            # distance (a board 50 cm away read as 514 cm).
-            # Must be a multiple of 16. Raising it costs proportional CPU.
-            #
-            # HARD CEILING: SGBM cannot match the leftmost `numDisparities`
-            # columns — there is nothing to their left in the other image to
-            # search against. Our frames are 240 px wide in the disparity
-            # direction, so 128 blanked out the left 128 px INCLUDING the
-            # centre crosshair at x=120, and the distance readout died
-            # completely. Keep this below ~40% of frame width.
-            #     96 -> left 96 px dead, centre fine, nearest 50 cm
-            # If you need to measure closer, move the CAMERAS closer together
-            # (nearest scales with baseline) — that costs nothing and does not
-            # eat the image.
             self.sgbm = cv2.StereoSGBM_create(
-                minDisparity=0, numDisparities=96, blockSize=7,
+                minDisparity=0, numDisparities=64, blockSize=7,
                 P1=8 * 49, P2=32 * 49, uniquenessRatio=10,
                 speckleWindowSize=100, speckleRange=2, disp12MaxDiff=1)
             self.ok = True
@@ -600,11 +588,19 @@ class App:
         rob = tk.LabelFrame(body, text="Robot", bg="#1e1e1e", fg="#ccc")
         rob.pack(fill="x", padx=8, pady=4)
 
-        # Drive: press-and-hold. There is no dead-man watchdog in the current
-        # firmware, so the motor runs until it's told to stop — release must
-        # send 'S'. STOP ALL is the panic button.
-        self._hold_btn(rob, "▲ FWD", "F", "S", 0, 0)
-        self._hold_btn(rob, "▼ BACK", "B", "S", 0, 1)
+        # Drive: TOGGLE, not hold-to-move. Click once to start moving that
+        # direction, click the same button again (or STOP ALL) to stop.
+        # The firmware has no dead-man watchdog either way -- it just runs
+        # until told 'S' -- so toggle mode isn't giving up any safety the
+        # firmware already had; it just removes the "must hold the mouse
+        # down" requirement the old hold-to-move buttons added on top.
+        self.drive_state = 0   # 0 = stopped, +1 = forward, -1 = backward
+        self.fwd_btn = tk.Button(rob, text="▲ FWD", width=10,
+                                 command=self._toggle_forward)
+        self.fwd_btn.grid(row=0, column=0, padx=3, pady=3)
+        self.back_btn = tk.Button(rob, text="▼ BACK", width=10,
+                                  command=self._toggle_backward)
+        self.back_btn.grid(row=0, column=1, padx=3, pady=3)
         # NOTE: macOS Tk ignores `bg` on a Button and draws the native white
         # widget, so bg="#8b0000" + fg="white" rendered as white-on-white —
         # an invisible panic button. Colour the TEXT instead; that is honoured
@@ -633,7 +629,7 @@ class App:
                                   bg="#1e1e1e", fg="#ccc", highlightthickness=0,
                                   troughcolor="#333", length=200,
                                   command=self._on_led_scale)
-        self.led_scale.set(9)
+        self.led_scale.set(4)
         self.led_scale.grid(row=2, column=1, columnspan=3, sticky="w")
 
         # Telemetry echo — confirms the S3 heard you. If you press LED ON and
@@ -686,6 +682,8 @@ class App:
             os.makedirs(d, exist_ok=True)
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._release_jobs = {}   # per-key debounce timers, see _key_up()
+        self._bind_drive_keys(root)
         self._tick()
 
     # ---- distance ----
@@ -771,6 +769,82 @@ class App:
         # stop on leave too — a motor left running is worse than a jerky UI.
         b.bind("<Leave>", lambda e: self.link.send(stop_cmd))
 
+    def _toggle_forward(self):
+        if self.drive_state == 1:
+            self.link.send("S")
+            self.drive_state = 0
+        else:
+            self.link.send("F")
+            self.drive_state = 1
+        self._update_drive_buttons()
+
+    def _toggle_backward(self):
+        if self.drive_state == -1:
+            self.link.send("S")
+            self.drive_state = 0
+        else:
+            self.link.send("B")
+            self.drive_state = -1
+        self._update_drive_buttons()
+
+    def _update_drive_buttons(self):
+        # Highlight whichever direction is currently active so it's obvious
+        # at a glance the robot is still moving without watching the video.
+        self.fwd_btn.config(bg="#2d6b2d" if self.drive_state == 1 else "#d9d9d9",
+                            fg="white" if self.drive_state == 1 else "black")
+        self.back_btn.config(bg="#2d6b2d" if self.drive_state == -1 else "#d9d9d9",
+                             fg="white" if self.drive_state == -1 else "black")
+
+    # ---- keyboard drive: F/B keys, works ALONGSIDE the click-toggle
+    # buttons above (both just flip the same drive_state) ----
+    #
+    # Holding a key down on any OS does NOT deliver one continuous "key is
+    # down" signal to Tkinter -- the OS's own key-repeat fires a rapid
+    # alternating stream of KeyRelease/KeyPress events for as long as you
+    # hold it. A naive "release = stop" binding would therefore stutter:
+    # stop, restart, stop, restart, many times a second while held.
+    #
+    # Fix: on release, don't stop immediately -- schedule the stop after a
+    # short delay. If the key is actually still held, the next auto-repeat
+    # KeyPress arrives within that delay and cancels the pending stop. Only
+    # a GENUINE release (nothing arrives in time) lets the stop go through.
+    # A quick tap also works correctly: press moves, and since no repeat
+    # follows, the debounced stop fires almost immediately after.
+    _KEY_DEBOUNCE_MS = 60
+
+    def _bind_drive_keys(self, root):
+        root.bind("<KeyPress-f>", lambda e: self._key_down("f"))
+        root.bind("<KeyRelease-f>", lambda e: self._key_up("f"))
+        root.bind("<KeyPress-b>", lambda e: self._key_down("b"))
+        root.bind("<KeyRelease-b>", lambda e: self._key_up("b"))
+        root.focus_set()   # window must have keyboard focus to see these at all
+
+    def _key_down(self, key):
+        pending = self._release_jobs.pop(key, None)
+        if pending is not None:
+            self.root.after_cancel(pending)
+            return   # this was an auto-repeat press -- already moving, ignore
+        if key == "f" and self.drive_state != 1:
+            self.link.send("F")
+            self.drive_state = 1
+            self._update_drive_buttons()
+        elif key == "b" and self.drive_state != -1:
+            self.link.send("B")
+            self.drive_state = -1
+            self._update_drive_buttons()
+
+    def _key_up(self, key):
+        self._release_jobs[key] = self.root.after(
+            self._KEY_DEBOUNCE_MS, lambda: self._key_up_confirmed(key))
+
+    def _key_up_confirmed(self, key):
+        self._release_jobs.pop(key, None)
+        if (key == "f" and self.drive_state == 1) or \
+           (key == "b" and self.drive_state == -1):
+            self.link.send("S")
+            self.drive_state = 0
+            self._update_drive_buttons()
+
     def _on_led_scale(self, val):
         # Tk fires this for every pixel of drag, so only send on change —
         # otherwise a single sweep floods the port with dozens of characters
@@ -791,6 +865,8 @@ class App:
         """Panic button: stop drive AND actuator."""
         self.link.send("S")
         self.link.send("X")
+        self.drive_state = 0
+        self._update_drive_buttons()
 
     # ---- live diagnostics ----
     def _diag_numbers(self):

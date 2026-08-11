@@ -36,7 +36,7 @@ IMU imu;
 LED led;
 
 //STEPPER VARIABLES
-int STEP_HZ = 200;
+int STEP_HZ = 100;
 
  
 //ACTUATOR VARIABLES

@@ -24,6 +24,19 @@
   GND while resetting to enter bootloader. Disconnect adapter after.
 
   -------------------------------------------------------------------
+  RESOLUTION CHANGE (bumped from QVGA up toward VGA for sharper CV
+  detection, then dialed back to CIF once VGA proved too much data for
+  BOTH cameras to stream together reliably):
+    frame_size raised 320x240 -> 400x296 (CIF). This INVALIDATES any
+    existing stereo_calib.npz (it was computed for 320x240 images) --
+    recalibrate with stereo_calibrate.py after reflashing BOTH cameras.
+    jpeg_quality was also lowered (= less compression, more detail) to
+    complement the resolution bump. If fps still feels low with both
+    cameras running, that's the two-camera bandwidth-sharing limit --
+    drop back toward FRAMESIZE_QVGA rather than raising jpeg_quality
+    further, since quality has less room to give before frames grow
+    close to VGA size again.
+  -------------------------------------------------------------------
   RECOVERY BEHAVIOR (added after field testing showed the stream could
   freeze permanently on a single glitch):
     1. Task watchdog — reboots the whole module if loop() ever fails to
@@ -67,68 +80,22 @@ static const uint8_t MAGIC[2] = { 0xAA, 0x55 };
 // --- Recovery tuning constants ---
 #define WDT_TIMEOUT_S 5           // reboot if no full frame completes within this many seconds
 #define WRITE_TIMEOUT_MS 1000     // give up on a single Serial.write() burst after this long
-// How many back-to-back esp_camera_fb_get() failures before we assume the
-// sensor is wedged and do a full driver re-init. The re-init costs ~0.5 s,
-// so if the sensor merely stutters, a LOW value here throttles the frame
-// rate badly. The watchdog above is the real safety net, so this can be
-// generous. TEST: 5 (original) vs 100 — compare fps in stream_quality.py.
 #define MAX_CONSECUTIVE_FAILS 5
 
-// Flash the LED on each sensor re-init so you can SEE how often it happens.
-// 1 = diagnostic mode, 0 = normal operation.
 #define REINIT_BLINK 0
 
-// --- FIXED EXPOSURE / GAIN (see applyFixedImageSettings) ---
-// Both cameras are flashed from this file, so these are identical on both
-// by construction — that is the whole point. Tune for YOUR lighting, then
-// reflash BOTH cameras and re-run stream_quality.py to confirm the L and R
-// brightness figures now match.
-//   too dark  -> raise FIXED_EXPOSURE first, then FIXED_GAIN
-//   too noisy -> lower FIXED_GAIN (gain amplifies noise; exposure doesn't)
-//   motion blur in a moving robot -> lower exposure, raise gain
-//
-// EXPOSURE ALSO CONTROLS FRAME RATE — this is not obvious and it cost us a
-// debugging session. aec_value is an integration time in sensor rows. Once
-// it exceeds the frame period the OV5640 stretches its vertical blanking to
-// make room, so the sensor itself produces fewer frames per second. At 600
-// we measured 14.4 fps total and a badly overexposed image (mean 184/216,
-// near clipping); the brighter image also compressed worse (3378 B/frame vs
-// 2841), and the extra bytes pushed the UART link into occasional truncated
-// frames. Dropping the exposure fixed the rate, the exposure and the
-// truncations together. If you raise this, expect fps to fall.
 #define FIXED_EXPOSURE 200    // 0-1200  (was 600: overexposed + halved fps)
 #define FIXED_GAIN     4      // 0-30    (was 8: gain amplifies channel imbalance)
 
-// Fixed white balance preset. 0 auto, 1 sunny, 2 cloudy, 3 office, 4 home.
-// Must be the same on both cameras (it is — one file, both flashes).
 #define WB_MODE 3
 
-// --- ORIENTATION ---
-// These give 180 degree rotation and mirroring ONLY. A sensor cannot rotate
-// 90 degrees (that needs rows and columns transposed, which the hardware
-// doesn't do) — for a 90 degree mount, set ROTATE_DEG in the PANEL instead,
-// or better, rotate the physical mount.
 #define FLIP_VERTICAL     0   // 0 or 1
 #define MIRROR_HORIZONTAL 0   // 0 or 1
 
-// camera_config_t is moved to file scope (was local to setup() originally)
-// so that loop() can reuse the exact same config to re-init the sensor
-// without needing to duplicate/rebuild it.
 camera_config_t config = {};
 
-// Counts consecutive esp_camera_fb_get() failures. Reset to 0 on any
-// successful frame; once it crosses MAX_CONSECUTIVE_FAILS we assume the
-// sensor itself is wedged (not just a transient buffer underrun) and
-// force a driver-level re-init.
 int consecutiveFails = 0;
 
-// Sends `len` bytes from `data` over Serial, but gives up after
-// timeout_ms instead of blocking forever. Serial.write() by default
-// blocks indefinitely once the TX ring buffer fills — if the S3 stalls
-// (e.g. busy forwarding the other camera's frame), this used to hang
-// the whole loop with no way out. Returns false if it couldn't send
-// everything in time; the caller should just move on to the next frame
-// rather than treat this as fatal.
 bool writeWithTimeout(const uint8_t *data, size_t len, uint32_t timeout_ms) {
   uint32_t start = millis();
   size_t sent = 0;
@@ -139,13 +106,13 @@ bool writeWithTimeout(const uint8_t *data, size_t len, uint32_t timeout_ms) {
       sent += Serial.write(data + sent, chunk);
     }
     if (millis() - start > timeout_ms) {
-      return false;  // bail out — don't let one stalled receiver wedge the camera
+      return false;
     }
   }
   return true;
 }
 
-void applyFixedImageSettings();   // defined below setup()
+void applyFixedImageSettings();
 
 void setup() {
   // MUST equal CAM_BAUD in THIS ONE/include/StereoCameras.h.
@@ -153,14 +120,9 @@ void setup() {
   // Symptom of getting it wrong: telemetry still works, frames stay at 0.
   Serial.begin(460800);
 
-  // Arm the task watchdog on the loop task. `true` panics (reboots) on
-  // trigger rather than just printing a warning — we want automatic
-  // recovery here, not a message nobody will see on an unattended rig.
-  // NOTE: esp32 Arduino core 3.x (IDF 5.x) changed esp_task_wdt_init()
-  // from (timeout_s, panic_bool) to taking an esp_task_wdt_config_t*.
   esp_task_wdt_config_t twdt_config = {
     .timeout_ms = WDT_TIMEOUT_S * 1000,
-    .idle_core_mask = 0,     // don't watch idle tasks, just this one
+    .idle_core_mask = 0,
     .trigger_panic = true,
   };
 
@@ -185,37 +147,32 @@ void setup() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  // 20 MHz. Measured over 60 s through the S3, long ribbons, both cameras:
-  //   10 MHz : 16.6 fps, 0% corrupt, 0/998  frames grey-bottom
-  //   20 MHz : 23.4 fps, 0% corrupt, 0/1403 frames grey-bottom  <-- best
-  //
-  // HISTORY, so nobody "re-fixes" this: earlier tests appeared to show that
-  // 20 MHz caused corruption and 10 MHz was cleaner. That was wrong. The
-  // corruption came from the S3 reading its camera UARTs one byte at a time,
-  // which saturated the CPU and overflowed the RX buffers. Once StereoCameras
-  // bulk-reads the frame body, BOTH clocks are perfectly clean and 20 MHz is
-  // simply faster. Sensor clock was never the problem.
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_QVGA;  // 320x240 — keep! stereo calib assumes this
+  // Raised from FRAMESIZE_QVGA (320x240) for sharper crack detection,
+  // set to CIF rather than VGA -- VGA alone streamed fine on ONE camera
+  // but caused stream desync once BOTH ran together (too much combined
+  // data for the shared link to the S3/laptop). CIF is a middle ground:
+  // ~1.6x QVGA's pixel count (a real detail improvement) but only ~40%
+  // of VGA's data size.
+  // INVALIDATES stereo_calib.npz (computed for the old 320x240 size) --
+  // recalibrate with stereo_calibrate.py after reflashing BOTH cameras.
+  config.frame_size = FRAMESIZE_CIF;   // 400x296
 
-  // Frame buffers: 2 buffers REQUIRE PSRAM. Without it the allocation
-  // quietly falls short -> truncated (grey-bottom) frames and the same
-  // stale buffer returned forever. Adapt to what the board actually has:
   if (psramFound()) {
-    config.jpeg_quality = 20;          // ~4-8 KB/frame
+    // Lowered from 20 (less compression, more detail).
+    config.jpeg_quality = 14;          // was 20
     config.fb_count = 2;
     config.fb_location = CAMERA_FB_IN_PSRAM;
     config.grab_mode = CAMERA_GRAB_LATEST;
   } else {
-    config.jpeg_quality = 22;          // smaller frames to fit in DRAM
+    config.jpeg_quality = 16;          // was 22
     config.fb_count = 1;
     config.fb_location = CAMERA_FB_IN_DRAM;
     config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   }
 
   if (esp_camera_init(&config) != ESP_OK) {
-    // Camera failed — blink onboard flash LED (GPIO4) forever
     pinMode(4, OUTPUT);
     while (true) {
       digitalWrite(4, HIGH);
@@ -228,53 +185,27 @@ void setup() {
   applyFixedImageSettings();
 }
 
-// ---------------------------------------------------------------------
-// LOCK the image pipeline so BOTH cameras produce identically-exposed,
-// identically-coloured frames.
-//
-// Why this matters: left on auto, each sensor independently chooses its own
-// exposure, gain and white balance. In a dim pipe they diverge wildly (one
-// olive, one lilac). That breaks three things at once:
-//   * stereo matching compares left/right patches — mismatched colour and
-//     brightness make disparity (and therefore distance) unreliable
-//   * checkerboard corner detection during calibration
-//   * YOLO training data consistency
-//
-// Because both cameras are flashed from THIS FILE, these constants are
-// identical on both by construction. Never hand-tune one camera only.
-// ---------------------------------------------------------------------
 void applyFixedImageSettings() {
   sensor_t *s = esp_camera_sensor_get();
   if (!s) return;
 
-  // --- auto exposure/gain OFF (these must be identical on both cameras) ---
-  s->set_exposure_ctrl(s, 0); // auto exposure off
-  s->set_aec2(s, 0);          // "night mode" / extended AEC off
-  s->set_gain_ctrl(s, 0);     // auto gain off
+  s->set_exposure_ctrl(s, 0);
+  s->set_aec2(s, 0);
+  s->set_gain_ctrl(s, 0);
 
-  // --- white balance: FIXED PRESET, not "off" ---
-  // Turning white balance off entirely leaves the raw sensor channel gains
-  // uncorrected, which gives a heavy yellow/green cast. What we actually
-  // want is correction that is IDENTICAL on both cameras and never adapts:
-  // enable white balance, disable the auto-gain part, and pin a preset.
-  //   WB_MODE: 0 auto, 1 sunny, 2 cloudy, 3 office(fluorescent), 4 home(warm)
-  // Indoors under fluorescent/LED, 3 is usually closest. Try 2 or 4 if the
-  // cast is still off — but change it on BOTH cameras.
   s->set_whitebal(s, 1);
-  s->set_awb_gain(s, 0);      // don't let it drift per-camera
+  s->set_awb_gain(s, 0);
   s->set_wb_mode(s, WB_MODE);
 
-  // --- fixed values (TUNE THESE, then reflash BOTH cameras) ---
-  s->set_aec_value(s, FIXED_EXPOSURE);  // 0-1200, higher = brighter
-  s->set_agc_gain(s, FIXED_GAIN);       // 0-30,  higher = brighter + noisier
-  s->set_brightness(s, 0);              // -2..2
-  s->set_contrast(s, 0);                // -2..2
-  s->set_saturation(s, 0);              // -2..2
+  s->set_aec_value(s, FIXED_EXPOSURE);
+  s->set_agc_gain(s, FIXED_GAIN);
+  s->set_brightness(s, 0);
+  s->set_contrast(s, 0);
+  s->set_saturation(s, 0);
 
-  // --- correction features: keep identical, they affect appearance ---
-  s->set_bpc(s, 1);           // bad pixel correction
-  s->set_wpc(s, 1);           // white pixel correction
-  s->set_lenc(s, 1);          // lens shading correction
+  s->set_bpc(s, 1);
+  s->set_wpc(s, 1);
+  s->set_lenc(s, 1);
   s->set_hmirror(s, MIRROR_HORIZONTAL);
   s->set_vflip(s, FLIP_VERTICAL);
 }
@@ -283,52 +214,31 @@ void loop() {
 
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
-    // No frame available. Could be a transient underrun (fine, just
-    // retry) or a wedged sensor (SCCB/I2C lockup). We can't tell the
-    // difference from a single failure, so we count consecutive misses
-    // and only intervene once it's clearly not transient.
     consecutiveFails++;
     if (consecutiveFails > MAX_CONSECUTIVE_FAILS) {
-      // DIAGNOSTIC: flash the LED so re-inits are visible from across the
-      // bench. Frequent flashing = the sensor is failing often and this
-      // expensive teardown (~0.5 s each) is what's capping the frame rate.
-      // Set REINIT_BLINK to 0 once you've finished diagnosing.
 #if REINIT_BLINK
       pinMode(4, OUTPUT);
       digitalWrite(4, HIGH);
       delay(40);
       digitalWrite(4, LOW);
 #endif
-      esp_camera_deinit();  // tear down the wedged driver/sensor state
+      esp_camera_deinit();
       delay(100);
-      esp_camera_init(&config);  // bring it back up fresh using the same config
+      esp_camera_init(&config);
       consecutiveFails = 0;
     }
-    // NOTE: watchdog is deliberately NOT fed here. A real sensor wedge
-    // that the re-init above can't clear will keep failing until the
-    // WDT_TIMEOUT_S deadline, at which point the watchdog reboots the
-    // whole module as the final fallback.
     delay(10);
     return;
   }
 
   uint32_t len = fb->len;
 
-  // Send header + length + payload, each bounded by writeWithTimeout so
-  // a stalled S3 receiver can't block this loop indefinitely. If any
-  // part times out, the frame is abandoned (receiver-side framing will
-  // reject/resync on the next valid magic bytes) and we move on rather
-  // than hang.
   bool ok = writeWithTimeout(MAGIC, 2, WRITE_TIMEOUT_MS);
-  if (ok) ok = writeWithTimeout((uint8_t *)&len, 4, WRITE_TIMEOUT_MS);  // little-endian on ESP32
+  if (ok) ok = writeWithTimeout((uint8_t *)&len, 4, WRITE_TIMEOUT_MS);
   if (ok) ok = writeWithTimeout(fb->buf, fb->len, WRITE_TIMEOUT_MS);
 
   esp_camera_fb_return(fb);
 
-  // DIAGNOSTIC: flash the LED whenever a write times out. A timeout costs
-  // WRITE_TIMEOUT_MS (1 s!) AND leaves a half-sent frame on the wire, so
-  // frequent flashing here would explain both the ~1 fps and the truncated
-  // frames the panel keeps rejecting. Set REINIT_BLINK 0 when done.
 #if REINIT_BLINK
   if (!ok) {
     pinMode(4, OUTPUT);
@@ -339,10 +249,6 @@ void loop() {
 #endif
 
   if (ok) {
-    // Only reset the failure counter and feed the watchdog on a fully
-    // successful frame — this is the "proof of life" signal that the
-    // whole path (sensor -> encode -> UART) is actually working, not
-    // just that loop() is spinning.
     consecutiveFails = 0;
     esp_task_wdt_reset();
   }
