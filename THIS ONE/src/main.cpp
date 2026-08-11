@@ -54,7 +54,7 @@ uint32_t lastTelemetry = 0;
 
 
 void setup() {
-  Serial.begin(576000);
+  Serial.begin(460800);
 
   // RESERVE LEDC TIMERS FOR THE SERVOS BEFORE ANY OF THEM ATTACH.
   // ESP32Servo allocates channels dynamically and cannot see raw ledcSetup()
