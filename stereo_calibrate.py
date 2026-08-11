@@ -47,22 +47,93 @@ SQUARE_MM = 19.5          # printed square size in mm — MEASURE IT
 OUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "stereo_calib.npz")
 
+# How much image to keep when rectifying. This matters a lot when the two
+# cameras are NOT well aligned — which ours are not, being bonded 180 degrees
+# apart with a few degrees of residual roll.
+#
+#   0.0  crop to only fully-valid pixels. No black borders, but a badly
+#        aligned pair loses a LOT of field of view to the crop.
+#   1.0  keep every pixel. Nothing is thrown away, but the edges have black
+#        wedges where one camera had no data.
+#   0.5  a middle ground: most of the view, modest borders.
+#
+# We were on 0.0, which is why the effective FOV came out much narrower than
+# the 120-degree lenses should give. Black borders are harmless for viewing —
+# SGBM simply finds no match there and reports no distance, exactly as it
+# would off the edge of the frame.
+RECTIFY_ALPHA = 0.5
+
 
 # MUST match ROTATE_DEG in control_panel_stereo2.py — (left, right).
 # Calibration describes the images as the panel will see them; if the two
 # files disagree, every distance the panel reports is wrong.
-ROTATE_DEG = (270, 90)
+ROTATE_DEG = (90, 270)   # swapped with the L/R id swap in main.cpp
+
+# Horizontal mirror per camera, 0 or 1. Applied AFTER rotation, so it means
+# "flip what you are looking at left-to-right".
+#
+# A DIFFERENT operation from rotation: rotations preserve handedness, a mirror
+# reverses it, so no combination of rotations can substitute for one.
+#
+# Both cameras must match. Mirroring only one gives the two views opposite
+# handedness and no real-world point can be matched between them, which makes
+# stereo depth impossible rather than merely inaccurate.
+MIRROR_H = (1, 1)
+
 _ROTATE_FLAG = {90: cv2.ROTATE_90_CLOCKWISE,
                 180: cv2.ROTATE_180,
                 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
 
 
+# Corrupt-frame rejection. A torn frame is worse here than in a live view:
+# findChessboardCorners can still "succeed" on damaged pixels and feed the
+# solver garbage points, which quietly ruins the calibration.
+MAX_FLAT_BOTTOM = 0.05
+MAX_COLOUR_JUMP = 45.0
+rejected = [0, 0]          # per camera, reported while you capture
+
+
 def decode(jpeg, cam):
-    """cam: 0 = left, 1 = right (they may be mounted differently)."""
-    img = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_GRAYSCALE)
+    """cam: 0 = left, 1 = right (they may be mounted differently).
+
+    Returns None for a corrupt frame so the caller keeps its last good one.
+    """
+    # Decoded in COLOUR even though corner-finding wants grey, because the
+    # colour-band test needs the channels. Converted to grey at the end.
+    img = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        rejected[cam] += 1
+        return None
+
+    # CHECK BEFORE ROTATING — JPEG damage lands on the bottom rows in sensor
+    # orientation, and a 90/270 rotation moves it to a side edge where a
+    # bottom-rows test cannot see it.
+    gray_std = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).std(axis=1)
+    flat = 0
+    for v in gray_std[::-1]:
+        if v < 2.0:
+            flat += 1
+        else:
+            break
+    if flat / len(gray_std) > MAX_FLAT_BOTTOM:
+        rejected[cam] += 1
+        return None
+
+    rows = img.reshape(img.shape[0], -1, 3).mean(axis=1)
+    if len(rows) >= 8:
+        chroma = np.stack([rows[:, 0] - rows[:, 1],
+                           rows[:, 2] - rows[:, 1]], 1)
+        diffs = np.abs(np.diff(chroma[3:-3], axis=0)).sum(axis=1)
+        if len(diffs) and diffs.max() > MAX_COLOUR_JUMP:
+            rejected[cam] += 1
+            return None
+
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     deg = ROTATE_DEG[cam] % 360
-    if img is not None and deg:
+    if deg:
         img = cv2.rotate(img, _ROTATE_FLAG[deg])
+    if MIRROR_H[cam]:
+        img = cv2.flip(img, 1)
     return img
 
 
@@ -100,10 +171,17 @@ def main():
 
     while True:
         jl, jr = reader.latest(b"L"), reader.latest(b"R")
+        # Only replace the held frame when decode SUCCEEDS. Assigning the
+        # result directly would blank the view on every corrupt frame, which
+        # is exactly the flicker we are trying to remove.
         if jl is not None:
-            last_l = decode(jl, 0)
+            d = decode(jl, 0)
+            if d is not None:
+                last_l = d
         if jr is not None:
-            last_r = decode(jr, 1)
+            d = decode(jr, 1)
+            if d is not None:
+                last_r = d
         if last_l is None or last_r is None:
             # Say WHICH camera we're waiting on. Previously this loop was
             # silent, so a dead channel looked identical to a script that
@@ -124,8 +202,9 @@ def main():
 
         img_size = (last_l.shape[1], last_l.shape[0])
         view = cv2.hconcat([last_l, last_r])
-        cv2.putText(view, f"pairs: {len(obj_pts)}", (10, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, 255, 2)
+        cv2.putText(view, f"pairs: {len(obj_pts)}   rejected L{rejected[0]} "
+                          f"R{rejected[1]}", (10, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 1)
         cv2.imshow("L | R  (SPACE=capture, c=calibrate, q=quit)", view)
         key = cv2.waitKey(30) & 0xFF
 
@@ -162,12 +241,33 @@ def main():
             # and use them (it must not have to redo stereoRectify).
             r1, r2, p1, p2, _, _, _ = cv2.stereoRectify(
                 k1, d1, k2, d2, img_size, r, t,
-                flags=cv2.CALIB_ZERO_DISPARITY, alpha=0)
+                flags=cv2.CALIB_ZERO_DISPARITY, alpha=RECTIFY_ALPHA)
             map1x, map1y = cv2.initUndistortRectifyMap(
                 k1, d1, r1, p1, img_size, cv2.CV_32FC1)
             map2x, map2y = cv2.initUndistortRectifyMap(
                 k2, d2, r2, p2, img_size, cv2.CV_32FC1)
             fx = float(p1[0, 0])          # rectified focal length, pixels
+
+            # ---- VERIFY THE RECTIFICATION ----
+            # Corresponding points must land on the SAME ROW after rectifying.
+            # Drawing horizontal lines across both views is the standard way
+            # to check: pick any feature, and it should sit on the same line
+            # in both halves. If it does, the mount misalignment has been
+            # fully absorbed no matter how crooked the cameras are.
+            rl = cv2.remap(last_l, map1x, map1y, cv2.INTER_LINEAR)
+            rr = cv2.remap(last_r, map2x, map2y, cv2.INTER_LINEAR)
+            check = cv2.cvtColor(cv2.hconcat([rl, rr]), cv2.COLOR_GRAY2BGR)
+            for y in range(0, check.shape[0], 20):
+                cv2.line(check, (0, y), (check.shape[1], y), (0, 255, 0), 1)
+            cv2.line(check, (rl.shape[1], 0), (rl.shape[1], check.shape[0]),
+                     (0, 0, 255), 2)
+            cv2.imshow("RECTIFIED - a feature must sit on the SAME green line "
+                       "in both halves", check)
+            print("A rectification check window opened. Pick any feature and "
+                  "confirm it is on the same green line in both halves.")
+            print("Black borders are normal: that is the misalignment being "
+                  f"corrected. Raise RECTIFY_ALPHA (now {RECTIFY_ALPHA}) to "
+                  "keep more image, lower it toward 0 to crop them away.")
 
             np.savez(OUT_FILE,
                      # raw calibration (kept for reference / recomputation)

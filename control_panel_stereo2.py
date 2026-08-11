@@ -87,7 +87,23 @@ CV_CONF = 0.2
 # Ideally fix the MOUNTS so both cameras sit the same way and set this to
 # (0, 0); software rotation costs a little CPU per frame and is one more
 # thing to keep in sync with stereo_calibrate.py.
-ROTATE_DEG = (270, 90)   # left needs an extra 180 relative to right
+# (270, 90) + 180 on each = (90, 270). Both views were upside down.
+# The 180-degree offset BETWEEN the two cameras is unchanged, so they still
+# agree with each other — only their shared orientation flipped.
+# MUST match stereo_calibrate.py exactly or every distance is silently wrong.
+ROTATE_DEG = (90, 270)   # swapped with the L/R id swap in main.cpp
+
+# Horizontal mirror per camera, 0 or 1. Applied AFTER rotation, so it means
+# "flip what you are looking at left-to-right".
+#
+# A DIFFERENT operation from rotation: rotations preserve handedness, a mirror
+# reverses it, so no combination of rotations can substitute for one.
+#
+# Both cameras must match. Mirroring only one gives the two views opposite
+# handedness and no real-world point can be matched between them, which makes
+# stereo depth impossible rather than merely inaccurate.
+MIRROR_H = (1, 1)
+
 
 
 _ROTATE_FLAG = {90: cv2.ROTATE_90_CLOCKWISE,
@@ -370,6 +386,8 @@ class FrameLink:
             deg = ROTATE_DEG[cam] % 360
             if deg:
                 img = cv2.rotate(img, _ROTATE_FLAG[deg])
+            if MIRROR_H[cam]:
+                img = cv2.flip(img, 1)
             # Cheap per-camera image stats so the panel can show whether the
             # two cameras are exposed the same (needed for stereo matching).
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -415,7 +433,7 @@ class StereoCalib:
             self.fx = float(d["fx"])
             self.baseline = float(d["baseline"])       # mm
             self.sgbm = cv2.StereoSGBM_create(
-                minDisparity=0, numDisparities=64, blockSize=7,
+                minDisparity=0, numDisparities=128, blockSize=7,
                 P1=8 * 49, P2=32 * 49, uniquenessRatio=10,
                 speckleWindowSize=100, speckleRange=2, disp12MaxDiff=1)
             self.ok = True

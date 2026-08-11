@@ -18,8 +18,17 @@ int PIN_ACT_AIN2 = 8;
 int PIN_ACT_PWM  = 9;    // TB6612 PWMA — set to your actual pin
 int PIN_ACT_STBY = 10;   // TB6612 STBY — set to your actual pin
 
-int CAML_RX = 18;   // left cam U0T  -> S3
-int CAMR_RX = 16;   // right cam U0T -> S3
+// SWAPPED (was L=18, R=16). The panes were the wrong way round: the camera
+// mounted on the left was arriving as id 1 and showing in the right pane.
+// Fixing it here rather than in a panel means every consumer — both panels,
+// stereo_calibrate.py, the recordings — agrees, instead of one being patched
+// and the rest staying wrong.
+//
+// NOTE: ROTATE_DEG had to swap to match. Rotation belongs to the physical
+// camera (how it is mounted), so when the ids swap the rotations swap with
+// them: (90, 270) -> (270, 90) in all four Python files.
+int CAML_RX = 18;   // left cam U0T  -> S3 GPIO 18
+int CAMR_RX = 16;   // right cam U0T -> S3 GPIO 16
  
 int PIN_SDA = 13;
 int PIN_SCL = 14;
@@ -99,6 +108,31 @@ void setup() {
   }
 
 
+  // ---- startup summary ----
+  // Printed once so "it isn't working" can be answered by reading the boot
+  // log instead of guessing. Watch it with:  python3 robot_console.py
+  // then press the S3 reset button.
+  Serial.println("---- EDI PIPE CAM boot ----");
+  Serial.printf("hook servo  GPIO %2d  LEDC ch %d\n",
+                PIN_SERVO, hookServo.getChannel());
+  Serial.printf("spool servo GPIO %2d  LEDC ch %d\n",
+                PIN_SPOOL, spoolServo.getChannel());
+  Serial.printf("LED         GPIO %2d  LEDC ch 4  (timer 2)\n", PIN_LED);
+  Serial.printf("actuator    GPIO %2d  LEDC ch 6  (timer 3)\n", PIN_ACT_PWM);
+  Serial.printf("cameras     L GPIO %d, R GPIO %d @ %lu baud\n",
+                CAML_RX, CAMR_RX, (unsigned long)StereoCameras::CAM_BAUD);
+  // A servo channel of -1 means attach failed; two servos on the SAME channel,
+  // or a servo on 4 or 6, means something is stealing the other's output.
+  if (hookServo.getChannel() == spoolServo.getChannel()) {
+    Serial.println("*** BOTH SERVOS ON THE SAME LEDC CHANNEL ***");
+  }
+  if (hookServo.getChannel() == 4 || hookServo.getChannel() == 6 ||
+      spoolServo.getChannel() == 4 || spoolServo.getChannel() == 6) {
+    Serial.println("*** A SERVO IS ON THE LED OR ACTUATOR CHANNEL ***");
+  }
+  Serial.println(setupSuccessful ? "setup OK" : "SETUP HAD ERRORS (above)");
+  Serial.println("---------------------------");
+
     // Blink LED twice to confirm setup completed successfully
   if (true) {
     for (int i = 0; i < 2; i++) {
@@ -151,21 +185,7 @@ void loop() {
   while (Serial.available()) {
     char c = Serial.read();
 
-    //blink light if setup successful
-
-#if ENABLE_SPOOL_SEQUENCE
-    // spool sequence: ANY other key aborts a run in progress, so you never
-    // have to hunt for the right button to stop it. Checked BEFORE the
-    // switch so it applies to every command including STOP.
-    if (c != 'P') spoolSeqAbort();
-#endif
-
     switch (c) {
-
-#if ENABLE_SPOOL_SEQUENCE
-      // spool sequence: start the automated wind-in
-      case 'P': spoolSeqStart(); break;
-#endif
 
       //-- servo --
       case 'H': hookServo.setAngle(180); break;

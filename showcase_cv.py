@@ -29,7 +29,19 @@ CALIB_FILE = os.path.join(HERE, "stereo_calib.npz")
 # MUST match ROTATE_DEG in control_panel_stereo2.py and stereo_calibrate.py.
 # Not cosmetic: the disparity search only looks sideways, so both images must
 # be upright with the cameras separated along the image's horizontal axis.
-ROTATE_DEG = (270, 90)   # (left, right)
+ROTATE_DEG = (90, 270)   # (left, right) — swapped with the L/R id swap
+
+# Horizontal mirror per camera, 0 or 1. Applied AFTER rotation, so it means
+# "flip what you are looking at left-to-right".
+#
+# A DIFFERENT operation from rotation: rotations preserve handedness, a mirror
+# reverses it, so no combination of rotations can substitute for one.
+#
+# Both cameras must match. Mirroring only one gives the two views opposite
+# handedness and no real-world point can be matched between them, which makes
+# stereo depth impossible rather than merely inaccurate.
+MIRROR_H = (1, 1)
+
 
 _ROTATE_FLAG = {90: cv2.ROTATE_90_CLOCKWISE,
                 180: cv2.ROTATE_180,
@@ -38,16 +50,93 @@ _ROTATE_FLAG = {90: cv2.ROTATE_90_CLOCKWISE,
 
 def orient(img, cam):
     """Apply the per-camera rotation. cam is 'L' or 'R'."""
-    deg = ROTATE_DEG[0 if cam == "L" else 1] % 360
+    i = 0 if cam == "L" else 1
+    deg = ROTATE_DEG[i] % 360
     flag = _ROTATE_FLAG.get(deg)
-    return img if flag is None else cv2.rotate(img, flag)
+    if flag is not None:
+        img = cv2.rotate(img, flag)
+    if MIRROR_H[i]:
+        img = cv2.flip(img, 1)
+    return img
+
+
+# How much damage to tolerate before throwing a frame away. Same values the
+# other panel uses, and they were tuned against real corrupt captures.
+MAX_FLAT_BOTTOM = 0.05     # fraction of bottom rows allowed to be flat grey
+MAX_COLOUR_JUMP = 45.0     # biggest allowed chroma step between two rows
+
+# Rejection counters, so the panel can show how bad the link really is.
+drops = {"L": 0, "R": 0}
+
+
+def _flat_bottom_frac(img):
+    """Fraction of BOTTOM rows that are a single flat value.
+
+    A truncated capture decodes to real image on top and uniform grey below.
+    Byte-level checks cannot catch these — the JPEG often still ends with a
+    valid FFD9 — so this is the only reliable filter.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    row_std = gray.std(axis=1)
+    flat = 0
+    for v in row_std[::-1]:
+        if v < 2.0:
+            flat += 1
+        else:
+            break
+    return flat / gray.shape[0]
+
+
+def _colour_band_jump(img):
+    """Largest sudden CHROMA shift between consecutive rows.
+
+    A JPEG bitstream error mid-frame corrupts the DC predictor, so every block
+    after it inherits a wrong colour offset: normal on top, tinted below, with
+    a hard horizontal edge. The bottom is not flat, so the truncation filter
+    misses it entirely.
+
+    Compares chroma rather than brightness on purpose. A real scene edge — a
+    shadow line, a pipe rim — changes brightness while keeping its colour
+    balance, and must not be rejected. A DC error shifts the channels by
+    different amounts, which shows up in B-G / R-G even when brightness barely
+    moves.
+    """
+    rows = img.reshape(img.shape[0], -1, 3).mean(axis=1)
+    if len(rows) < 8:
+        return 0.0
+    chroma = np.stack([rows[:, 0] - rows[:, 1],      # B - G
+                       rows[:, 2] - rows[:, 1]], 1)  # R - G
+    diffs = np.abs(np.diff(chroma[3:-3], axis=0)).sum(axis=1)
+    return float(diffs.max()) if len(diffs) else 0.0
 
 
 def decode(jpeg_bytes, cam):
-    """JPEG bytes -> oriented BGR ndarray, or None if the frame is corrupt."""
+    """JPEG bytes -> oriented BGR ndarray, or None if the frame is corrupt.
+
+    Returning None makes the panel hold its last good frame, which looks far
+    better than flashing a torn one. This panel had NO corruption filter at
+    all, so every damaged frame went straight to the screen — that is what
+    "glitching" looked like.
+    """
     arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    return None if img is None else orient(img, cam)
+    if img is None:
+        drops[cam] = drops.get(cam, 0) + 1
+        return None
+
+    # CHECK BEFORE ROTATING. Both detectors assume SENSOR orientation: JPEG
+    # damage always affects the tail of the image in scan order, i.e. the
+    # bottom rows. After a 90/270 rotation that tail becomes a vertical band
+    # on the left or right edge, and a bottom-rows test would look straight
+    # past it.
+    if _flat_bottom_frac(img) > MAX_FLAT_BOTTOM:
+        drops[cam] = drops.get(cam, 0) + 1
+        return None
+    if _colour_band_jump(img) > MAX_COLOUR_JUMP:
+        drops[cam] = drops.get(cam, 0) + 1
+        return None
+
+    return orient(img, cam)
 
 
 # --------------------------------------------------------------------------
@@ -77,7 +166,7 @@ class StereoCalib:
             self.fx = float(d["fx"])
             self.baseline = float(d["baseline"])          # mm
             self.sgbm = cv2.StereoSGBM_create(
-                minDisparity=0, numDisparities=96, blockSize=7,
+                minDisparity=0, numDisparities=128, blockSize=7,
                 P1=8 * 49, P2=32 * 49, uniquenessRatio=10,
                 speckleWindowSize=100, speckleRange=2, disp12MaxDiff=1)
             self.ok = True
@@ -239,6 +328,22 @@ class CVWorker(threading.Thread):
         with self._out_lock:
             return list(self.detections), self.infer_ms, self.depth_ms
 
+    def distance_at(self, x, y):
+        """Distance in mm to one pixel of the RECTIFIED left image, or None.
+
+        Exists so the panel can show a distance WITHOUT needing a crack
+        detection. Detection distances only appear when the model fires, and
+        with the model out of domain that can be never — which looked like
+        the stereo pipeline being broken when it was working fine.
+
+        Thread-safe: the disparity map is rewritten by the worker thread.
+        """
+        with self._out_lock:
+            disp = self.disp
+        if disp is None or not self.calib.ok:
+            return None
+        return self.calib.distance_mm(disp, x, y)
+
     def stop(self):
         self.running = False
 
@@ -266,9 +371,13 @@ def draw_detections(frame_bgr, detections):
     for mask_xy, label, conf, dist in detections:
         pts = np.asarray(mask_xy, dtype=np.int32)
         x, y = int(pts[:, 0].min()), int(pts[:, 1].min())
+        # Always show a distance field, even when it could not be measured.
+        # Omitting it silently made a working stereo pipeline look broken:
+        # you cannot tell "no distance" from "this label has no distance".
+        # "-- cm" means the crack is nearer than the minimum range, sitting
+        # in the left dead zone, or on a surface too smooth for SGBM.
         txt = f"{label} {conf:.2f}"
-        if dist is not None:
-            txt += f"  {dist / 10.0:.1f} cm"
+        txt += f"  {dist / 10.0:.1f} cm" if dist is not None else "  -- cm"
         (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
         y = max(y, th + 6)
         cv2.rectangle(out, (x, y - th - 6), (x + tw + 6, y), MASK_COLOR, -1)

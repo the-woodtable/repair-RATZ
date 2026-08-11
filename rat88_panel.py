@@ -60,7 +60,7 @@ from pathlib import Path
 from PySide6.QtCore import (QBuffer, QObject, QPoint, QRect, QSize, Qt,
                             QTimer, Signal)
 from PySide6.QtGui import (QColor, QFont, QIcon, QImage, QPainter,
-                           QPen, QPixmap)
+                           QPen, QPixmap, QTransform)
 from PySide6.QtWidgets import (QApplication, QLabel, QPushButton, QSlider,
                                QWidget)
 
@@ -70,6 +70,16 @@ try:
     HAVE_SERIAL = True
 except ImportError:
     HAVE_SERIAL = False
+
+# Per-camera rotation, (left, right). Taken from showcase_cv so there is one
+# source of truth when OpenCV is available; the literal is only a fallback for
+# the no-cv2 path, which is exactly the case that needs it most.
+# KEEP THE FALLBACK IN SYNC WITH showcase_cv.py — check_project.py verifies it.
+try:
+    from showcase_cv import ROTATE_DEG, MIRROR_H
+except Exception:                    # noqa: BLE001 - cv2 missing, etc.
+    ROTATE_DEG = (90, 270)
+    MIRROR_H = (1, 1)
 
 try:
     import numpy as np
@@ -1210,6 +1220,18 @@ class Panel(QWidget):
         if not self._use_cv:
             img = QImage.fromData(jpeg, "JPG")
             if not img.isNull():
+                # Rotate here too. Without this the no-CV path showed raw
+                # sensor orientation while the CV path applied ROTATE_DEG, so
+                # the picture flipped depending on whether OpenCV happened to
+                # be installed. Qt does the rotation so this path keeps
+                # working with no cv2 available.
+                i = 0 if cam == "L" else 1
+                deg = ROTATE_DEG[i] % 360
+                if deg:
+                    img = img.transformed(QTransform().rotate(deg))
+                if MIRROR_H[i]:
+                    # Negative x scale = horizontal mirror.
+                    img = img.transformed(QTransform().scale(-1, 1))
                 pane.show_frame(img)
             return
 

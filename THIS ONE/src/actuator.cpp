@@ -56,8 +56,13 @@ void Actuator::extend(int speed) {
   if (speed < 0)   speed = 0;
   if (speed > 255) speed = 255;
 
-  digitalWrite(ain1_, HIGH);
-  digitalWrite(ain2_, LOW);
+  // DIRECTION SWAPPED (was ain1 HIGH / ain2 LOW). The motor was wired such
+  // that 'D' drove the lining backwards and 'R' drove it forwards. Fixing it
+  // here rather than swapping the D/R keys in a panel keeps the names honest
+  // — extend() genuinely extends — and fixes BOTH panels at once instead of
+  // leaving the other one inverted.
+  digitalWrite(ain1_, LOW);
+  digitalWrite(ain2_, HIGH);
   ledcWrite(ACT_PWM_CH, speed);
 
   state_ = 1;
@@ -68,8 +73,8 @@ void Actuator::retract(int speed){
   if (speed < 0)   speed = 0;
   if (speed > 255) speed = 255;
 
-  digitalWrite(ain1_, LOW);
-  digitalWrite(ain2_, HIGH);
+  digitalWrite(ain1_, HIGH);   // swapped to match extend() — see above
+  digitalWrite(ain2_, LOW);
   ledcWrite(ACT_PWM_CH, speed);
 
   state_ = -1;
