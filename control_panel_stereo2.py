@@ -94,7 +94,7 @@ CV_CONF = 0.4
 # controls the much bigger decision of "stop and reposition for a human to
 # look at this" -- a false positive here wastes travel distance and an
 # operator's attention, so it's set high on purpose.
-AUTO_DEPLOY_CONF = 0.70
+AUTO_DEPLOY_CONF = 0.60
 # Lower bar: a detection needs at least this much confidence to make the
 # robot stop and take a closer look at all. Below this, it's ignored and
 # scanning continues -- only detections at or above this get a second look.
