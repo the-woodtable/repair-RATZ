@@ -137,6 +137,27 @@ def decode(jpeg, cam):
     return img
 
 
+def _normalize_corner_order(corners):
+    """cv2.findChessboardCorners does NOT guarantee the same starting corner
+    across different board orientations. If the checkerboard appears
+    rotated/flipped relative to the camera in some captures (easy to happen
+    when tilting the board to stay visible to a tilted camera), the corner
+    sequence for THOSE captures comes back reversed relative to the others.
+    That silently corrupts the object-point <-> image-point correspondence
+    for exactly those pairs -- a handful of reversed captures mixed into an
+    otherwise good set is enough to blow up RMS error by 10-20x, which is
+    consistent with RMS staying stuck high regardless of how many more pairs
+    get added.
+
+    Enforce one consistent starting corner: whichever end of the detected
+    sequence is closer to the image origin (top-left) becomes corner 0."""
+    first = corners[0, 0]
+    last = corners[-1, 0]
+    if (first[0] + first[1]) > (last[0] + last[1]):
+        corners = corners[::-1].copy()
+    return corners
+
+
 def find_port():
     """Pick the S3's own native USB port, on any OS.
 
@@ -254,6 +275,8 @@ def main():
                         30, 0.001)
                 cl = cv2.cornerSubPix(last_l, cl, (5, 5), (-1, -1), crit)
                 cr = cv2.cornerSubPix(last_r, cr, (5, 5), (-1, -1), crit)
+                cl = _normalize_corner_order(cl)
+                cr = _normalize_corner_order(cr)
                 obj_pts.append(objp)
                 pts_l.append(cl)
                 pts_r.append(cr)
@@ -286,12 +309,15 @@ def main():
             k2 = np.zeros((3, 3))
             d2 = np.zeros((4, 1))
             try:
-                _, k1, d1, _, _ = cv2.fisheye.calibrate(
+                rms1, k1, d1, _, _ = cv2.fisheye.calibrate(
                     obj_fe, l_fe, img_size, k1, d1, flags=fe_flags,
                     criteria=crit)
-                _, k2, d2, _, _ = cv2.fisheye.calibrate(
+                rms2, k2, d2, _, _ = cv2.fisheye.calibrate(
                     obj_fe, r_fe, img_size, k2, d2, flags=fe_flags,
                     criteria=crit)
+                print(f"single-camera RMS  L {rms1:.3f} px   R {rms2:.3f} px "
+                      "(want < ~1.0 each -- if either is high, that "
+                      "camera's captures likely need retaking)")
             except cv2.error as e:
                 print(f"fisheye single-camera calibration failed: {e}")
                 print("Usually means one or more captured pairs has a bad "
@@ -301,10 +327,18 @@ def main():
                 continue
 
             try:
+                # NOT fixing intrinsics here (no CALIB_FIX_INTRINSIC) --
+                # letting the stereo step refine K1/D1/K2/D2 jointly rather
+                # than trusting the single-camera fits exactly. Forcing them
+                # fixed is the usual cause of the
+                # "abs_max < threshold" assertion inside stereoCalibrate:
+                # if the single-camera fit above isn't quite right, forcing
+                # the stereo step to treat it as ground truth produces an
+                # inconsistency severe enough that OpenCV's internal sanity
+                # check aborts rather than returning a silently-bad result.
                 rms, k1, k2, d1, d2, r, t = cv2.fisheye.stereoCalibrate(
                     obj_fe, l_fe, r_fe, k1, d1, k2, d2, img_size,
-                    flags=getattr(cv2.fisheye, "CALIB_FIX_INTRINSIC", 0),
-                    criteria=crit)
+                    flags=0, criteria=crit)
             except cv2.error as e:
                 print(f"fisheye stereo calibration failed: {e}")
                 continue

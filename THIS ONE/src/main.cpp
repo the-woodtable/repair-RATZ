@@ -56,7 +56,7 @@ int STEP_HZ = 100;
 float STEPS_PER_MM = 3.222f;
 
 //ACTUATOR VARIABLES
-int ACT_SPEED = 100;   // 0-255, default speed for jog commands
+int ACT_SPEED = 50;   // 0-255, default speed for jog commands
 
 //OTHER VARIABLES
 bool setupSuccessful = true;
