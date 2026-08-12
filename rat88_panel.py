@@ -61,8 +61,16 @@ from PySide6.QtCore import (QBuffer, QObject, QPoint, QRect, QSize, Qt,
                             QTimer, Signal)
 from PySide6.QtGui import (QColor, QFont, QIcon, QImage, QPainter,
                            QPen, QPixmap, QTransform)
-from PySide6.QtWidgets import (QApplication, QLabel, QPushButton, QSlider,
+from PySide6.QtWidgets import (QApplication, QDialog, QGridLayout, QLabel,
+                               QPushButton, QScrollArea, QSlider, QVBoxLayout,
                                QWidget)
+
+try:
+    import auto_sequence as auto
+    HAVE_AUTO = True
+except ImportError as _aexc:         # panel still runs, just manual-only
+    HAVE_AUTO = False
+    AUTO_IMPORT_ERROR = str(_aexc)
 
 try:
     import serial
@@ -129,8 +137,13 @@ ASSETS = {
     # Lining pair. "_on" is the selected/lit artwork.
     "can":            "buttons/07lining_compressed.png",
     "can_on":         "buttons/08lining_deployed.png",
-    "spool":          "buttons/25sized_spool_extended.png",
-    "spool_on":       "buttons/26sized_spool_retracted.png",
+    # Automation and utilities. The spool buttons used to live here; the
+    # spool servo is still reachable from the keyboard (T / Y).
+    "start":          "buttons/27start.png",
+    "stop":           "buttons/28stop.png",
+    "home":           "buttons/29home.png",
+    "folder":         "buttons/30folder.png",
+    "distance":       "buttons/cm_travelled.png",   # click to zero
 
     # Hook positions, named the way you name them. HOOK_POSITIONS below says
     # which servo command each one sends.
@@ -167,18 +180,26 @@ GEO = {
     "video_right":  QRect(576, 172,  380, 506),
 
     # Vertical lamp slider: big sun (bright) on top, small sun at the bottom.
-    "sun_max":      QRect(68,  228,   48,  55),
-    "slider":       QRect(45,  288,  104, 300),
-    "sun_min":      QRect(74,  594,   37,  42),
+    "sun_max":      QRect(58,  194,   48,  55),
+    "slider":       QRect(30,  254,  104, 300),
+    "sun_min":      QRect(66,  560,   37,  42),
 
     # Boxes match each PNG's own aspect ratio, centred on the mockup position,
     # so fit() has no slack to letterbox away.
     "arrow_up":     QRect(1040, 385, 185, 207),
     "arrow_down":   QRect(1036, 618, 192, 214),
 
-    # Lining group - mutually exclusive, one runs at a time.
-    "can":          QRect(208, 733,  162, 164),
-    "spool":        QRect(462, 736,  178, 169),
+    # Lining actuator.
+    "can":          QRect(425, 740,  163, 165),
+
+    # Automation column down the left, under the lamp slider.
+    "start":        QRect(38,  607,   77,  76),
+    "stop":         QRect(38,  697,   76,  77),
+    "home":         QRect(38,  785,   77,  77),
+    "folder":       QRect(215, 792,  107,  75),
+
+    # Odometer. The number is drawn into the pale window in the artwork.
+    "distance":     QRect(1022, 165, 236, 196),
 
     # Hook group - three servo positions, left to right. Keys match the names
     # in HOOK_POSITIONS; swap these rects if you reorder that list.
@@ -241,7 +262,31 @@ HOOK_BOOT = "H"
 # Each entry is (off command, on command, off label, on label, starts on).
 # ---------------------------------------------------------------------------
 LINING = ("R", "D", "compressed", "deployed", False)
+# The spool has no button any more, but the servo still exists on the robot,
+# so T and Y stay on the keyboard. There is no artwork to show its state.
 SPOOL = ("Y", "T", "string out", "wound in", False)
+
+# ---------------------------------------------------------------------------
+# THE ODOMETER
+#
+# sendTelemetry() in main.cpp emits {"pos_mm": steps / STEPS_PER_MM every
+# TELEM_INTERVAL_MS. The panel counts nothing itself; it divides by 10 for cm,
+# which is the same number control_panel_stereo2 shows.
+#
+# 'Z' runs stepper.zero() and imu.zero(). Clicking the readout sends it.
+# The reading is SIGNED - reversing counts down. It is a position along the
+# pipe, not a total-distance trip meter.
+# ---------------------------------------------------------------------------
+ODO_CMD_ZERO = "Z"
+ODO_FIELD = "pos_mm"
+ODO_FIELD_FALLBACK = "steps"
+ODO_SCREEN = (0.076, 0.097, 0.924, 0.724)     # window inside the artwork
+# Only for firmware that sends "steps" but not "pos_mm". Must match main.cpp;
+# test_panel.py checks that it does.
+STEPS_PER_MM = 3.222
+# Seconds before a reading blanks to "--". None keeps the last number on
+# screen, matching control_panel_stereo2.
+ODO_STALE_S = None
 
 # ---------------------------------------------------------------------------
 # THE LAMP
@@ -340,6 +385,17 @@ def fit(pm: QPixmap, size: QSize) -> QPixmap:
                  (size.height() - sc.height()) // 2, sc)
     p.end()
     return canvas
+
+
+def _as_float(v):
+    """Telemetry values arrive as strings. Returns None rather than raising,
+    so one malformed field cannot take the odometer down."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def load(key: str, size: QSize) -> QPixmap:
@@ -491,10 +547,23 @@ class SelectableButton(ArtButton):
     """
 
     def __init__(self, pixmap: QPixmap, rect: QRect, parent=None,
-                 on_pixmap: QPixmap = None, selected=False):
+                 on_pixmap: QPixmap = None, selected=False,
+                 dim_selected=False):
         super().__init__(pixmap, rect, parent)
         fitted = fit(pixmap, rect.size())
         has_on = on_pixmap is not None and not on_pixmap.isNull()
+
+        if dim_selected and not has_on:
+            # Inverted: the SELECTED one is greyed out, the other stays full
+            # colour. Used for start/stop, where the greyed button reads as
+            # "this is the mode you are in" rather than "this is disabled".
+            self._sel_pm = self._fade(fitted, 0.45)
+            self._unsel_pm = fitted
+            self._selected = None
+            self._apply_mask(fitted)
+            self.set_selected(selected)
+            return
+
         self._sel_pm = fit(on_pixmap, rect.size()) if has_on else fitted
         # With separate on/off artwork the off state is used as drawn. Without
         # it, fade the base image toward the background so the two states still
@@ -533,6 +602,128 @@ class SelectableButton(ArtButton):
 
     def is_selected(self) -> bool:
         return bool(self._selected)
+
+
+class _HeadlessToggleButton:
+    """Stand-in for a SelectableButton that has no artwork on the panel.
+
+    The spool servo still exists on the robot but lost its buttons, so its
+    Toggle keeps working from the keyboard with one of these in place of a
+    widget. Everything is a no-op except remembering the state.
+    """
+
+    def __init__(self):
+        self.sel = None
+        self.clicked = _NullSignal()
+
+    def set_selected(self, on):
+        self.sel = on
+
+    def is_selected(self):
+        return bool(self.sel)
+
+    def setToolTip(self, _t):
+        pass
+
+
+class _NullSignal:
+    def connect(self, _fn):
+        pass
+
+
+class ScreenshotGallery(QDialog):
+    """The FOLDER button's window: thumbnails of this run's flagged cracks.
+
+    Reads the folder fresh each time it opens, so it picks up anything saved
+    since last look. Click a thumbnail to see it full size.
+    """
+
+    THUMB = QSize(220, 165)
+
+    def __init__(self, folder, parent=None):
+        super().__init__(parent)
+        self.folder = folder
+        self.setWindowTitle("Flagged cracks")
+        self.resize(760, 560)
+        self.setStyleSheet(f"background:{C_BG.name()};")
+
+        outer = QVBoxLayout(self)
+        self.caption = QLabel(self)
+        self.caption.setStyleSheet(
+            f"color:{C_INK.name()}; font-family:Arial; font-size:13px;")
+        outer.addWidget(self.caption)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("border:none;")
+        inner = QWidget()
+        self.grid = QGridLayout(inner)
+        self.grid.setSpacing(10)
+        scroll.setWidget(inner)
+        outer.addWidget(scroll, 1)
+
+        self.reload()
+
+    def reload(self):
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        shots = []
+        if self.folder and os.path.isdir(self.folder):
+            shots = sorted(
+                os.path.join(self.folder, f) for f in os.listdir(self.folder)
+                if f.lower().endswith((".png", ".jpg", ".jpeg")))
+
+        if not shots:
+            self.caption.setText(
+                f"No screenshots yet.\n{self.folder or 'no folder yet'}\n"
+                "Cracks are only captured while a scan is running, and only "
+                f"when confidence is between {scv_conf_min()} and "
+                f"{scv_conf_max()}.")
+            return
+
+        self.caption.setText(f"{len(shots)} flagged this run  ·  {self.folder}")
+        for i, path in enumerate(shots):
+            pm = QPixmap(path)
+            if pm.isNull():
+                continue
+            cell = QLabel(self)
+            cell.setPixmap(pm.scaled(self.THUMB, Qt.KeepAspectRatio,
+                                     Qt.SmoothTransformation))
+            cell.setToolTip(os.path.basename(path))
+            cell.setCursor(Qt.PointingHandCursor)
+            cell.mousePressEvent = lambda _e, p=path: self._open_full(p)
+            name = QLabel(os.path.basename(path), self)
+            name.setStyleSheet(
+                f"color:{C_INK.name()}; font-family:Menlo,monospace;"
+                "font-size:10px;")
+            name.setWordWrap(True)
+            name.setFixedWidth(self.THUMB.width())
+            row, col = divmod(i, 3)
+            self.grid.addWidget(cell, row * 2, col)
+            self.grid.addWidget(name, row * 2 + 1, col)
+
+    def _open_full(self, path):
+        dlg = QDialog(self)
+        dlg.setWindowTitle(os.path.basename(path))
+        dlg.setStyleSheet("background:#111;")
+        lay = QVBoxLayout(dlg)
+        lbl = QLabel(dlg)
+        pm = QPixmap(path)
+        lbl.setPixmap(pm.scaled(QSize(900, 700), Qt.KeepAspectRatio,
+                                Qt.SmoothTransformation))
+        lay.addWidget(lbl)
+        dlg.exec()
+
+
+def scv_conf_min():
+    return auto.SCREENSHOT_CONF_MIN if HAVE_AUTO else "?"
+
+
+def scv_conf_max():
+    return auto.SCREENSHOT_CONF_MAX if HAVE_AUTO else "?"
 
 
 class Toggle:
@@ -738,6 +929,7 @@ class SerialLink(QObject):
         self._tx = queue.Queue()
         self._stop = threading.Event()
         self._buf = bytearray()
+        self._textbuf = bytearray()      # loose telemetry text between frames
         self._last_t = {"L": time.time(), "R": time.time()}
         self.fps = {"L": 0.0, "R": 0.0}
 
@@ -796,14 +988,43 @@ class SerialLink(QObject):
         else:
             self._sim()
 
+    def _stash_text(self, chunk: bytes):
+        """Bytes that are not part of any frame.
+
+        sendTelemetry() in main.cpp uses plain Serial.print - it is NOT wrapped
+        in the AA 55 frame - so its text arrives interleaved between frames.
+        Discarding non-magic bytes, which is the obvious thing to do, drops
+        every telemetry line on the floor and the odometer never updates.
+        """
+        self._textbuf += chunk
+        while True:
+            nl = self._textbuf.find(b"\n")
+            if nl < 0:
+                break
+            line = bytes(self._textbuf[:nl])
+            del self._textbuf[:nl + 1]
+            text = line.decode("ascii", "replace").strip()
+            if text:
+                self.telemetry.emit(text)
+        if len(self._textbuf) > 4096:      # binary junk, no newline coming
+            del self._textbuf[:-256]
+
     def _parse(self):
         while True:
             i = self._buf.find(MAGIC)
             if i < 0:
-                if len(self._buf) > 1:
-                    del self._buf[:-1]          # keep a possible split magic
+                # Hold back the last byte ONLY if it could be the first half
+                # of a magic split across two reads. Parking it
+                # unconditionally strands a trailing newline, and the
+                # telemetry line it terminates is never emitted.
+                keep = 1 if self._buf.endswith(MAGIC[:1]) else 0
+                cut = len(self._buf) - keep
+                if cut > 0:
+                    self._stash_text(bytes(self._buf[:cut]))
+                    del self._buf[:cut]
                 return
             if i:
+                self._stash_text(bytes(self._buf[:i]))
                 del self._buf[:i]
             if len(self._buf) < 7:
                 return
@@ -908,12 +1129,24 @@ class Panel(QWidget):
         # the slider sits at 9 while the lamp reads "off". Both are true.
         self.led_on = LED_BOOT_ON
         self._led_last = None
+        self._gallery = None
+
+        # The autonomous sequence. None if auto_sequence.py is missing, in
+        # which case the panel stays a manual-control panel.
+        self.auto = None
+        if HAVE_AUTO:
+            self.auto = auto.AutoSequence(
+                send=self.send,
+                get_pos_mm=self.current_pos_mm,
+                on_status=self._set_auto_status)
+        self.auto_status = "idle" if HAVE_AUTO else "automation unavailable"
         self._last_cmd = "-"
         self._telem = {}
         self._telem_seen = 0.0
         self.link_text = "starting"
         self._det_count = 0
         self._nearest = None
+        self._dets = []
 
         # CV is optional at every level: missing opencv, missing ultralytics,
         # missing CV.pt and missing stereo_calib.npz each degrade separately
@@ -941,7 +1174,10 @@ class Panel(QWidget):
 
         self.ticker = QTimer(self)
         self.ticker.timeout.connect(self.refresh_status)
-        self.ticker.start(200)
+        # 50ms, close to the 40ms tick the sequence was tuned against in
+        # control_panel_stereo2 — AUTO_PAUSE_SETTLE_TICKS and
+        # AUTO_PAUSE_CONFIRM_TICKS count ticks, so the rate is behaviour.
+        self.ticker.start(50)
 
     # -- geometry ----------------------------------------------------------
     def g(self, key: str) -> QRect:
@@ -1031,14 +1267,70 @@ class Panel(QWidget):
             "Space stops it immediately.")
         self.lining = Toggle(can_btn, LINING, self.on_lining)
 
-        spool_btn = SelectableButton(load("spool", G("spool").size()),
-                                     G("spool"), self,
-                                     load_opt("spool_on", G("spool").size()))
-        spool_btn.setToolTip(
-            f"Spool servo — click to wind in ('{SPOOL[1]}'), "
-            f"click again to pay out ('{SPOOL[0]}').\n"
-            "A servo parks itself, so there is nothing to stop.")
-        self.spool = Toggle(spool_btn, SPOOL, self.on_spool)
+        # The spool lost its artwork but not its servo, so it keeps a Toggle
+        # with a stand-in button. T and Y still work; there is just nothing on
+        # screen showing which way it is.
+        self.spool = Toggle(_HeadlessToggleButton(), SPOOL, self.on_spool)
+
+        # ---- automation: start and stop are one either/or pair -------------
+        # Exactly one is lit at a time, and the lit one is the greyed one, so
+        # the panel always shows whether the robot is running itself or
+        # sitting under manual control. STOP starts out selected because
+        # nothing is running yet.
+        self.run = ButtonGroup(self.on_run)
+
+        self.btn_start = SelectableButton(
+            load("start", G("start").size()), G("start"), self,
+            selected=False, dim_selected=True)
+        self.btn_start.setToolTip("Start the automatic scan.\n"
+                                  "Drives forward, stops at anything that "
+                                  "looks like a crack, deploys a lining.")
+        self.run.add("start", self.btn_start)
+
+        self.btn_stop = SelectableButton(
+            load("stop", G("stop").size()), G("stop"), self,
+            selected=True, dim_selected=True)
+        self.btn_stop.setToolTip("Stop everything — drive, actuator and any "
+                                 "running sequence.\nSame as the space bar.")
+        self.run.add("stop", self.btn_stop)
+
+        self.btn_home = ArtButton(load("home", G("home").size()),
+                                  G("home"), self)
+        self.btn_home.setToolTip("Drive back to position 0, then zero the "
+                                 "odometer.\nNeeds telemetry; refuses while a "
+                                 "sequence is running.")
+        self.btn_home.clicked.connect(lambda *_a: self.go_home())
+
+        self.btn_folder = ArtButton(load("folder", G("folder").size()),
+                                    G("folder"), self)
+        self.btn_folder.setToolTip("Screenshots of ambiguous cracks from this "
+                                   "run.")
+        self.btn_folder.clicked.connect(lambda *_a: self.show_gallery())
+
+        # ---- odometer: a readout that is also its own reset button --------
+        rect = G("distance")
+        self.btn_odo = ArtButton(load("distance", rect.size()), rect, self)
+        self.btn_odo.setToolTip("Distance along the pipe.\n"
+                                "Click to zero it (sends 'Z').")
+        self.btn_odo.clicked.connect(lambda *_a: self.zero_odometer())
+
+        # The number goes in the pale window inside the artwork. fit() centres
+        # the art in its box, so find where the art actually landed first.
+        art = load("distance", rect.size())
+        ax = rect.x() + (rect.width() - art.width()) // 2
+        ay = rect.y() + (rect.height() - art.height()) // 2
+        fx0, fy0, fx1, fy1 = ODO_SCREEN
+        win = QRect(ax + int(fx0 * art.width()), ay + int(fy0 * art.height()),
+                    int((fx1 - fx0) * art.width()),
+                    int((fy1 - fy0) * art.height()))
+        self.odo = QLabel("--", self)
+        self.odo.setGeometry(win)
+        self.odo.setAlignment(Qt.AlignCenter)
+        self.odo.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.odo.setStyleSheet(
+            f"color:{C_INK.name()}; font-family:Menlo,Consolas,monospace;"
+            f"font-size:{max(12, int(win.height() * 0.5))}px; font-weight:700;"
+            "background:transparent;")
 
         # ---- hook group: exactly one position lit at a time ---------------
         # Built straight from HOOK_POSITIONS so the buttons, the commands, the
@@ -1139,6 +1431,90 @@ class Panel(QWidget):
             # sent has also switched the lamp on (or off, at 0). Mirror it.
             self.led_on = v > 0
 
+    # ---- automation ------------------------------------------------------
+    def current_pos_mm(self):
+        """Odometer in mm, or None. This is the sequence's only position
+        feedback, so returning None matters: it makes homing and repositioning
+        fail safely instead of driving blind."""
+        mm = _as_float(self._telem.get(ODO_FIELD))
+        if mm is not None:
+            return mm
+        steps = _as_float(self._telem.get(ODO_FIELD_FALLBACK))
+        return None if steps is None else steps / STEPS_PER_MM
+
+    def on_run(self, key: str):
+        """The start/stop pair. ButtonGroup has already lit one and dimmed the
+        other; this decides what that means."""
+        if key == "start":
+            self.auto_start()
+        else:
+            self.stop_all()
+
+    def sync_run_buttons(self):
+        """Keep the pair honest.
+
+        The sequence can end on its own - it finishes a lining, it reaches
+        home, it loses telemetry - and the space bar and losing window focus
+        also stop it. None of those go through the buttons, so without this
+        the panel would sit there claiming to be running.
+
+        set_selected, not choose: this reflects state, it must not re-issue
+        the command.
+        """
+        want = "start" if (self.auto and self.auto.running) else "stop"
+        if self.run.selected() != want:
+            self.run.set_selected(want)
+
+    def auto_start(self):
+        if not self.auto:
+            self._last_cmd = "automation unavailable"
+            return
+        if self.auto.running:
+            self._last_cmd = "already running"
+            return
+        self.auto.start()
+
+    def go_home(self):
+        """HOME: drive back to 0, then zero the odometer once it arrives."""
+        if not self.auto:
+            self.zero_odometer()          # no sequence available: just zero
+            return
+        self.auto.return_home(zero_on_arrival=True)
+
+    def show_gallery(self):
+        folder = self.auto.inspection_dir if self.auto else None
+        if self._gallery is None:
+            self._gallery = ScreenshotGallery(folder, self)
+        else:
+            self._gallery.folder = folder
+            self._gallery.reload()
+        self._gallery.show()
+        self._gallery.raise_()
+
+    def zero_odometer(self):
+        """Reset to 0. 'Z' calls stepper.zero() and imu.zero() on the ESP32.
+
+        Blanks the display straight away rather than waiting for the next
+        telemetry packet, because nothing acknowledges 'Z'.
+        """
+        self.send(ODO_CMD_ZERO)
+        self._telem.pop(ODO_FIELD, None)
+        self._telem.pop(ODO_FIELD_FALLBACK, None)
+        self.odo.setText("0.0")
+
+    def update_odometer(self):
+        """Shows the same number as control_panel_stereo2: pos_mm / 10 in cm,
+        falling back to the step count on firmware without pos_mm."""
+        if (ODO_STALE_S is not None
+                and (time.time() - self._telem_seen) > ODO_STALE_S):
+            self.odo.setText("--")
+            return
+        mm = self.current_pos_mm()
+        if mm is not None:
+            self.odo.setText(f"{mm / 10.0:.1f}")
+        elif not self._telem:
+            self.odo.setText("--")
+
     def toggle_led(self):
         """L key. LED::on() restores the last brightness, so the slider
         position stays meaningful across an off/on cycle."""
@@ -1152,7 +1528,7 @@ class Panel(QWidget):
         self.slider.setValue(min(hi, max(lo, self.slider.value() + delta)))
 
     def stop_all(self):
-        """Panic: stop the drive and cut the lining actuator.
+        """Panic: cancel any sequence, stop the drive, cut the lining actuator.
 
         The toggle is deliberately left where it is. Stopping mid-travel means
         the lining is somewhere between compressed and deployed, and flipping
@@ -1160,6 +1536,10 @@ class Panel(QWidget):
         status line says "stopped" instead. Servos are not touched - they are
         already parked and holding.
         """
+        # Cancel the sequence FIRST. Otherwise its next tick would happily
+        # re-send 'F' and the robot would carry on after the panic button.
+        if self.auto:
+            self.auto.stop()
         self.send("S")
         self.link.send("X")
         self.act_until = 0.0
@@ -1176,8 +1556,8 @@ class Panel(QWidget):
             self.btn_back.setDown(True); self.drive("B")
         elif k == Qt.Key_Space:
             self.stop_all()
-        elif k == Qt.Key_Z:
-            self.send("Z")
+        elif e.text().upper() == ODO_CMD_ZERO:
+            self.zero_odometer()      # same path as clicking the readout
         elif e.text().upper() in HOOK_LABEL:
             self.set_hook(e.text().upper())
         elif e.text().upper() == LINING[1]:      # D - deploy
@@ -1250,11 +1630,19 @@ class Panel(QWidget):
                            bgr if cam == "R" else None)
             if cam == "L":
                 dets, _, _ = self.cv.latest()
+                self._dets = dets          # the sequence reads these on tick
                 if dets:
                     bgr = scv.draw_detections(bgr, dets)
                     self._det_count = len(dets)
                     self._nearest = min(
-                        (d[3] for d in dets if d[3] is not None), default=None)
+                        (d.dist_mm for d in dets if d.dist_mm is not None),
+                        default=None)
+                    # Screenshot AFTER drawing, so the saved image carries the
+                    # outline and label. The sequence decides whether this one
+                    # is worth keeping and whether it has been seen before.
+                    if self.auto:
+                        for d in dets:
+                            self.auto.maybe_capture(bgr, d, cam)
                 else:
                     self._det_count = 0
                     self._nearest = None
@@ -1270,10 +1658,20 @@ class Panel(QWidget):
     def _set_link_text(self, t: str):
         self.link_text = t
 
+    def _set_auto_status(self, t: str):
+        self.auto_status = t
+
     def refresh_status(self):
         """Recompute the status strip. Still worth running when the strip is
         hidden: this is the only place the actuator countdown ages out."""
         now = time.time()
+
+        # Drive the sequence from the ticker rather than from frame arrival,
+        # so a stall in the video cannot leave a homing run going forever.
+        if self.auto and self.auto.running:
+            self.auto.step(self._dets, now)
+        self.sync_run_buttons()
+
         age = now - self._telem_seen
         tel = "  ".join(f"{k}={v}" for k, v in list(self._telem.items())[:4]) \
             if self._telem and age < 3 else "telemetry: none"
@@ -1311,6 +1709,8 @@ class Panel(QWidget):
             f"lining={self.lining.label()}{motor}   "
             f"spool={self.spool.label()}   "
             f"lamp={lamp}   sent={self._last_cmd}\n"
+            f"AUTO[{self.auto.state if self.auto else '-'}] "
+            f"{self.auto_status}   "
             f"{cv_txt}   {tel}     "
             f"[{'/'.join(HOOK_LABEL)}]=hook  [D/R]=lining  [T/Y]=spool  "
             "[L]=lamp  [-/=]=bright  [space]=stop  [esc]=quit")

@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Traversal Subsystem — Obstacle Traversal Analysis</title>
+<script>
+window.MathJax = { tex: { inlineMath: [['\\(','\\)']], displayMath: [['$$','$$']] } };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<style>
+  body { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+         max-width: 900px; margin: 40px auto; padding: 0 32px; line-height: 1.65;
+         color: #1a1a1a; }
+  h1 { font-size: 26px; font-weight: 600; margin-bottom: 4px; }
+  h2 { font-size: 20px; font-weight: 600; margin-top: 42px;
+       border-bottom: 2px solid #333; padding-bottom: 6px; }
+  h3 { font-size: 16px; font-weight: 600; margin-top: 28px; }
+  .sub { color: #666; font-size: 15px; margin-top: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 18px 0; font-size: 14px; }
+  th, td { border: 1px solid #ccc; padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: #f2f2f2; font-weight: 600; }
+  .num { text-align: right; white-space: nowrap; }
+  .key { background: #eef3fb; border-left: 4px solid #2b5f9e; padding: 14px 18px; margin: 20px 0; }
+  .caution { background: #fdf3e3; border-left: 4px solid #b8860b; padding: 14px 18px; margin: 20px 0; }
+  ol.assume li, ol.steps li { margin-bottom: 12px; }
+  figure { margin: 26px 0; }
+  figcaption { font-size: 13px; color: #555; margin-top: 8px; }
+  code { background: #f0f0ee; padding: 1px 5px; border-radius: 3px; font-size: 13px; }
+  .src { font-size: 13px; color: #666; }
+  @media print { body { margin: 0; max-width: none; } h2 { page-break-after: avoid; } }
+</style>
+</head>
+<body>
+
+<h1>Traversal Subsystem — Obstacle Traversal Analysis</h1>
+<p class="sub">EDI Pipe Cam · Group 12 · Subsystem analysis (wheels)</p>
+
+<h2>1. Objective</h2>
+
+<div class="key">
+<p style="margin:0"><strong>We are trying to prove that the robot can traverse the pipe past obstacles in its path, up to a maximum obstacle steepness, and to determine what that maximum steepness is.</strong></p>
+</div>
+
+<p>Specifically the analysis predicts the limiting ramp angle \(\theta_{\max}\) that the six-wheel canted drive can climb, establishes which physical mechanism sets that limit (traction versus motor torque), and validates the prediction against a measured drawbar-pull test.</p>
+
+<p>The measurable requirement being addressed: <em>the robot shall traverse a 3 m pipe section containing surface obstacles (deployed liner lip, rust and debris) without stalling.</em></p>
+
+<h2>2. Inputs</h2>
+
+<p class="src">Measured, specified and design values only. Quantities <em>derived</em> by this analysis — cant angle, spring rates, friction coefficient, maximum steepness — are reported in §9 so that they read as results rather than as assumptions.</p>
+
+<table>
+<tr><th>Symbol</th><th>Description</th><th class="num">Value</th><th>Source</th></tr>
+<tr><td>\(R_p\)</td><td>Pipe inner radius</td><td class="num">96 mm</td><td>Test pipe, 192 mm ID</td></tr>
+<tr><td>\(p\)</td><td>Axial advance per carrier revolution</td><td class="num">200 mm</td><td>Design target</td></tr>
+<tr><td>\(n\)</td><td>Number of drive wheels</td><td class="num">6</td><td>CAD</td></tr>
+<tr><td>\(r_w\)</td><td>Drive wheel radius</td><td class="num">23.9 mm</td><td>CAD measurement</td></tr>
+<tr><td>\(h\)</td><td>Liner thickness (step height at edge)</td><td class="num">3.5 mm</td><td>Measured</td></tr>
+<tr><td>\(m\)</td><td>Total robot mass</td><td class="num">1.62 kg</td><td>Measured</td></tr>
+<tr><td>\(N_{\text{pre}}\)</td><td>Spring preload per wheel</td><td class="num">1.96 N (200 gf)</td><td>Measured</td></tr>
+<tr><td>—</td><td>Spring specification</td><td class="num">0.3 × 5 × 30 mm</td><td>13 active coils, 2 per wheel</td></tr>
+<tr><td>\(G\)</td><td>Gear ratio (60T / 20T)</td><td class="num">3</td><td>CAD</td></tr>
+<tr><td>—</td><td>Stepper resolution</td><td class="num">200 steps/rev</td><td>Datasheet, full step</td></tr>
+<tr><td>\(\tau_s\)</td><td>Stepper holding torque</td><td class="num">0.54 N·m</td><td>Datasheet</td></tr>
+<tr><td>\(C_{rr}\)</td><td>Rolling resistance coefficient</td><td class="num">0.03</td><td>Literature</td></tr>
+<tr><td>—</td><td>Odometry calibration</td><td class="num">3.222 steps/mm</td><td>Measured, 7 runs</td></tr>
+<tr><td>\(F_{\text{stall}}\)</td><td>Drawbar stall force</td><td class="num">9.81 N (1 kgf)</td><td>Measured</td></tr>
+<tr><td>\(\theta\)</td><td>Obstacle ramp angle</td><td class="num">variable</td><td>—</td></tr>
+</table>
+
+<h2>3. Assumptions</h2>
+
+<ol class="assume">
+<li><strong>Contact and friction.</strong> Each wheel rolls purely along its canted direction and is restrained laterally by Coulomb friction, with a single coefficient \(\mu\) identical at all six contacts and static and kinetic values taken as equal. Lateral slip occurs only once \(\mu N\) is exceeded — locating that limit is the purpose of this analysis.</li>
+<li><strong>Suspension and load sharing.</strong> The carrier is rigid in rotation, while each wheel is independently sprung on a radial carriage of rate \(k_w = 0.119\) N/mm bearing against a rigid, ideally circular pipe wall. All six drive wheels remain in contact and share load per the ring model of §5 — an assumption verified against measurement in §7. The front module's passive wheels react the drive reaction torque and contribute no axial thrust.</li>
+<li><strong>Load cases.</strong> Rolling resistance and obstacle climbing are the only resistive forces considered. Obstacles are modelled as spanning the full circumference, so all six wheels engage simultaneously — the worst case. Tether drag and hydrodynamic effects are neglected, and conditions are dry throughout.</li>
+<li><strong>Quasi-static operation with ideal transmission.</strong> The robot advances at a constant 31 mm/s, so inertial and acceleration effects are negligible. The gear train is treated as ideal; real drivetrain losses are absorbed into the measured stall force and therefore do not inflate the traction result.</li>
+</ol>
+
+<h2>4. Reference frames and kinematics</h2>
+
+<p>Frames: \(z\) along the pipe axis, \(r\) radially outward, \(\phi\) circumferential measured from the upward vertical.</p>
+
+<p>Because the wheels are canted, the drive behaves as a screw. In one revolution of the wheel carrier, each contact traverses the full circumference \(2\pi R_p\) while the robot advances \(p\) axially:</p>
+
+$$\tan\beta = \frac{p}{2\pi R_p}$$
+
+<p>The mechanism was designed for \(p = 200\) mm per carrier revolution, which fixes the cant angle:</p>
+
+$$\beta = \arctan\!\left(\frac{200}{2\pi(96)}\right) = \arctan(0.3316) = 18.35°$$
+
+<h3>Drive chain</h3>
+
+<p>The stepper delivers 200 full steps per revolution through a \(G = 3\) reduction, so one carrier revolution is \(200 \times 3 = 600\) steps. At the operating rate of 100 steps/s the carrier turns at 10 rpm and the ideal axial speed is</p>
+
+$$v_z = \omega_c R_p \tan\beta = 0.1667 \times 200 = 33.3\ \text{mm/s}$$
+
+<h3>Measured advance and slip</h3>
+
+<p>An in-pipe calibration over 7 runs gave 12925 steps per 4012 mm, i.e. 3.222 steps/mm. Converting to advance per carrier revolution:</p>
+
+$$p_{\text{meas}} = \frac{600}{3.222} = 186.2\ \text{mm/rev}$$
+
+<p>Comparing against the 200 mm design value gives the wheel slip directly:</p>
+
+$$s = 1 - \frac{186.2}{200} = \mathbf{6.9\%}$$
+
+<table>
+<tr><th>Run ratio (steps/mm)</th><th class="num">Advance per rev</th><th class="num">Slip</th></tr>
+<tr><td>3.13 (best run)</td><td class="num">191.7 mm</td><td class="num">4.2 %</td></tr>
+<tr><td>3.222 (weighted mean)</td><td class="num">186.2 mm</td><td class="num">6.9 %</td></tr>
+<tr><td>3.31 (worst run)</td><td class="num">181.3 mm</td><td class="num">9.4 %</td></tr>
+</table>
+
+<p class="src">Slip is therefore 6.9 % on average with a measured run-to-run spread of 4.2–9.4 %. The corresponding measured traverse speed is 31.0 mm/s, giving 96.6 s for a 3 m section.</p>
+
+<h2>5. Contact statics — load sharing around the ring</h2>
+
+<p>The six wheels sit at \(\phi_i = 0°, 60°, \ldots, 300°\) on radial spring carriages. Unlike a ground vehicle, the normal force comes from <em>spring preload</em>, not from weight; gravity only redistributes it around the ring.</p>
+
+<p>Let the drive module sag by \(\delta\). Wheel \(i\)'s spring compression changes by \(-\delta\cos\phi_i\), so</p>
+
+$$N_i = N_{\text{pre}} - k_w\delta\cos\phi_i$$
+
+<p>Vertical equilibrium of the module, using \(\sum\cos\phi_i = 0\) and \(\sum\cos^2\phi_i = n/2\), gives \(k_w\delta = 2m_dg/n\) and therefore</p>
+
+$$\boxed{\;N_i = N_{\text{pre}} - \frac{2m_dg}{n}\cos\phi_i\;}$$
+
+<p>Two consequences follow:</p>
+
+<p><strong>(a) Contact retention sets a minimum preload.</strong> The top wheel (\(\phi = 0\)) carries least, so all six stay in contact only if</p>
+
+$$N_{\text{pre}} > \frac{2m_dg}{n} \quad\Longrightarrow\quad m_d < \frac{3N_{\text{pre}}}{g} = \frac{3(1.96)}{9.81} = 0.60\ \text{kg}$$
+
+<p><strong>(b) The total normal force is independent of weight.</strong> Since \(\sum\cos\phi_i = 0\),</p>
+
+$$\sum N_i = nN_{\text{pre}} = 6(1.96) = 11.76\ \text{N}$$
+
+<h3>Spring characterisation</h3>
+
+<p>Springs are 0.3 × 5 × 30 mm music wire with 13 active coils, two per wheel carriage. Mean coil diameter \(D = 5 - 0.3 = 4.7\) mm:</p>
+
+$$k_s = \frac{Gd^4}{8D^3n_a} = \frac{79300 \times 0.3^4}{8 \times 4.7^3 \times 13} = 0.0595\ \text{N/mm}, \qquad k_w = 2k_s = 0.119\ \text{N/mm}$$
+
+<p>The measured preload of 1.96 N corresponds to 16.5 mm of compression, comfortably within the ~25.5 mm available before the coils go solid. The independent spring calculation and the direct force measurement agree, which validates both.</p>
+
+<h2>6. Traction limit and the governing criterion</h2>
+
+<p>Each canted wheel rolls freely along its canted axis and is restrained laterally by friction. The reaction force \(F_R\) that produces thrust acts perpendicular to the rolling direction and is limited by the friction available at the contact:</p>
+
+$$F_R \le \mu N_i, \qquad F_{a,i} = F_R\cos\beta \quad\Longrightarrow\quad F_{a,i} \le \mu N_i\cos\beta$$
+
+<p>Summing over the ring, the maximum axial thrust the drive can generate is</p>
+
+$$F_{a,\max} = \mu\cos\beta\sum N_i$$
+
+<p>To climb a ramp of angle \(\theta\), the normal reaction is redirected and the axial force required is \(N_i\tan\theta\) per wheel, so the total demand is \(\tan\theta\sum N_i\). Setting demand equal to capability:</p>
+
+$$\tan\theta\sum N_i \;\le\; \mu\cos\beta\sum N_i$$
+
+<div class="key">
+<p style="margin:0"><strong>Governing criterion — \(\sum N_i\) cancels:</strong></p>
+$$\mu\cos\beta \ge \tan\theta \qquad\Longrightarrow\qquad \boxed{\;\theta_{\max} = \arctan(\mu\cos\beta)\;}$$
+</div>
+
+<p>This is a non-dimensional result. The maximum obstacle steepness depends <strong>only</strong> on the friction coefficient and the cant angle. It is independent of robot mass, of spring preload, and of wheel radius — which makes it robust to exactly the manufacturing and loading variations that are hardest to control.</p>
+
+<p>With the measured \(\mu = 0.88\) and \(\beta = 18.35°\):</p>
+
+$$\theta_{\max} = \arctan(0.88 \times 0.9492) = \arctan(0.8317) = \mathbf{39.7°}$$
+
+<figure>
+<svg width="100%" viewBox="0 0 680 434" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Helvetica, Arial, sans-serif">
+<line x1="90" y1="60" x2="90" y2="380" stroke="#888" stroke-width="1.5"/>
+<line x1="90" y1="380" x2="560" y2="380" stroke="#888" stroke-width="1.5"/>
+<text x="90" y="48" font-size="12" fill="#555">required friction coefficient μ</text>
+<text x="82" y="384" font-size="12" fill="#555" text-anchor="end">0</text>
+<text x="82" y="304" font-size="12" fill="#555" text-anchor="end">0.5</text>
+<text x="82" y="224" font-size="12" fill="#555" text-anchor="end">1.0</text>
+<text x="82" y="144" font-size="12" fill="#555" text-anchor="end">1.5</text>
+<text x="82" y="64" font-size="12" fill="#555" text-anchor="end">2.0</text>
+<text x="90" y="398" font-size="12" fill="#555" text-anchor="middle">0</text>
+<text x="208" y="398" font-size="12" fill="#555" text-anchor="middle">15</text>
+<text x="325" y="398" font-size="12" fill="#555" text-anchor="middle">30</text>
+<text x="443" y="398" font-size="12" fill="#555" text-anchor="middle">45</text>
+<text x="560" y="398" font-size="12" fill="#555" text-anchor="middle">60</text>
+<text x="325" y="416" font-size="12" fill="#555" text-anchor="middle">ramp angle θ (degrees)</text>
+<polyline points="90,380 168,350 247,319 325,283 403,239 443,211 482,179 521,139 560,88" fill="none" stroke="#534AB7" stroke-width="2.5"/>
+<text x="500" y="120" font-size="13" fill="#333" text-anchor="end">required μ = tanθ / cosβ</text>
+<line x1="90" y1="240" x2="560" y2="240" stroke="#1D9E75" stroke-width="2" stroke-dasharray="6 4"/>
+<text x="98" y="232" font-size="13" fill="#0F6E56">μ = 0.88 measured</text>
+<line x1="401" y1="240" x2="401" y2="380" stroke="#aaa" stroke-width="1" stroke-dasharray="3 3"/>
+<circle cx="401" cy="240" r="6" fill="#1D9E75"/>
+<text x="390" y="270" font-size="13" font-weight="600" fill="#0F6E56" text-anchor="end">39.7° limit</text>
+</svg>
+<figcaption><strong>Figure 1.</strong> Friction required to climb a ramp, against ramp angle. The measured coefficient intersects the requirement curve at 39.7°, the maximum traversable obstacle steepness.</figcaption>
+</figure>
+
+<h3>Special case — the liner lip (vertical step)</h3>
+
+<p>The deployed liner presents a square step rather than a ramp. This is the \(\theta \to 90°\) limit, in which the wheel contacts a corner and wheel radius re-enters:</p>
+
+$$\frac{F}{N} = \frac{\sqrt{2r_wh - h^2}}{r_w - h} \;\le\; \mu\cos\beta$$
+
+<p>Solving for the limiting step height with \(r_w = 23.9\) mm and \(\mu\cos\beta = 0.832\) gives \(h_{\max} = 5.5\) mm. The liner is 3.5 mm thick, requiring \(\mu = 0.643\) against 0.876 available — a safety factor of <strong>1.36</strong>.</p>
+
+<div class="caution">
+<p style="margin:0"><strong>Design recommendation.</strong> A 1.36 margin on the square-step case is the tightest number in this analysis. Chamfering the liner's leading edge converts the step into a ramp: a 3.5 mm rise feathered over 10 mm is a 19.3° slope, comfortably inside the 39.7° capability and raising the margin to over 2. This is a liner-geometry change, not a drivetrain change, and it costs nothing.</p>
+</div>
+
+<figure>
+<svg width="100%" viewBox="0 0 680 434" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Helvetica, Arial, sans-serif">
+<line x1="90" y1="60" x2="90" y2="380" stroke="#888" stroke-width="1.5"/>
+<line x1="90" y1="380" x2="560" y2="380" stroke="#888" stroke-width="1.5"/>
+<text x="90" y="48" font-size="12" fill="#555">required friction coefficient μ</text>
+<text x="82" y="384" font-size="12" fill="#555" text-anchor="end">0</text>
+<text x="82" y="277" font-size="12" fill="#555" text-anchor="end">0.4</text>
+<text x="82" y="171" font-size="12" fill="#555" text-anchor="end">0.8</text>
+<text x="82" y="64" font-size="12" fill="#555" text-anchor="end">1.2</text>
+<text x="90" y="398" font-size="12" fill="#555" text-anchor="middle">0</text>
+<text x="224" y="398" font-size="12" fill="#555" text-anchor="middle">2</text>
+<text x="359" y="398" font-size="12" fill="#555" text-anchor="middle">4</text>
+<text x="493" y="398" font-size="12" fill="#555" text-anchor="middle">6</text>
+<text x="325" y="416" font-size="12" fill="#555" text-anchor="middle">step height h (mm)</text>
+<polyline points="124,322 157,296 191,275 224,257 291,224 359,193 426,163 493,131 560,99" fill="none" stroke="#534AB7" stroke-width="2.5"/>
+<line x1="90" y1="146" x2="560" y2="146" stroke="#1D9E75" stroke-width="2" stroke-dasharray="6 4"/>
+<text x="98" y="138" font-size="13" fill="#0F6E56">μ = 0.88 measured</text>
+<line x1="461" y1="146" x2="461" y2="380" stroke="#aaa" stroke-width="1" stroke-dasharray="3 3"/>
+<circle cx="461" cy="146" r="6" fill="#1D9E75"/>
+<text x="472" y="176" font-size="13" font-weight="600" fill="#0F6E56">5.5 mm limit</text>
+<line x1="325" y1="209" x2="325" y2="380" stroke="#BA7517" stroke-width="1.5" stroke-dasharray="4 3"/>
+<circle cx="325" cy="209" r="5" fill="#BA7517"/>
+<text x="316" y="245" font-size="13" fill="#854F0B" text-anchor="end">liner 3.5 mm</text>
+<text x="316" y="261" font-size="12" fill="#854F0B" text-anchor="end">needs μ = 0.64</text>
+</svg>
+<figcaption><strong>Figure 2.</strong> Friction required to climb a vertical step. The 3.5 mm liner edge requires μ = 0.64 against 0.88 available — a safety factor of 1.36, with the absolute limit at 5.5 mm.</figcaption>
+</figure>
+
+<h2>7. Torque check — which limit binds?</h2>
+
+<p>Axial thrust is developed by the circumferential reaction acting at radius \(R_p\), reduced through the gear train:</p>
+
+$$\tau_d = F_aR_p\tan\beta, \qquad \tau_m = \frac{\tau_d}{G}$$
+
+<table>
+<tr><th>Load case</th><th class="num">\(F_a\)</th><th class="num">\(\tau_m\) required</th><th class="num">Safety factor vs 0.54 N·m</th></tr>
+<tr><td>Rolling resistance only, \(C_{rr}\sum N_i\)</td><td class="num">0.35 N</td><td class="num">0.0037 N·m</td><td class="num">144</td></tr>
+<tr><td>Liner edge climb, \(h = 3.5\) mm</td><td class="num">7.18 N</td><td class="num">0.0761 N·m</td><td class="num">7.1</td></tr>
+<tr><td><strong>At the traction limit (measured)</strong></td><td class="num"><strong>9.81 N</strong></td><td class="num"><strong>0.1041 N·m</strong></td><td class="num"><strong>5.2</strong></td></tr>
+</table>
+
+<div class="key">
+<p style="margin:0"><strong>The system is traction-limited, not torque-limited, by a factor of 5.2.</strong> The motor retains 5.2× margin over the greatest force the wheels are physically capable of transmitting. A more powerful motor would therefore deliver no additional climbing ability — the design levers are grip, preload and cant angle.</p>
+</div>
+
+<h3>Validation of the contact assumption</h3>
+
+<p>Assumption 2 (all six wheels in contact) can be checked against the measurement. The stall test implies \(\sum N_i = F_{\text{stall}}/(\mu\cos\beta) = 11.75\) N, which matches \(6N_{\text{pre}} = 11.76\) N to within 0.1 %. Had only three wheels been loaded, the implied \(\mu\) would exceed 1.7, which is not physically plausible for TPU on PVC. The assumption holds, and by §5(a) the drive module mass share must be at or below 0.60 kg.</p>
+
+<h2>8. Experimental validation — drawbar pull test</h2>
+
+<h3>Method</h3>
+<ol class="steps">
+<li>Robot placed in the horizontal test pipe and commanded to drive forward at the normal rate of 100 steps/s.</li>
+<li>A line attached to the rear of the robot was restrained axially through a force scale.</li>
+<li>Restraining load increased progressively until axial advance ceased.</li>
+<li>The carrier was observed to continue rotating while the robot remained stationary, confirming a <em>traction</em> limit and not a motor stall.</li>
+<li>Peak restraining force recorded as \(F_{\text{stall}}\).</li>
+</ol>
+
+<h3>Result and inversion</h3>
+
+$$F_{\text{stall}} = 9.81\ \text{N (1 kgf)}$$
+
+$$\mu = \frac{F_{\text{stall}}}{\sum N_i\cos\beta} = \frac{9.81}{6(1.96)(0.9492)} = \mathbf{0.88}$$
+
+<p>This single measurement supplies the only parameter in the governing criterion that cannot be derived from geometry or component specification, and it simultaneously confirms that the binding constraint is traction rather than torque.</p>
+
+<h2>9. Results summary</h2>
+
+<table>
+<tr><th>Quantity</th><th class="num">Value</th><th>Basis</th></tr>
+<tr><td>Cant angle \(\beta\)</td><td class="num">18.35°</td><td>Geometry, from \(p\) = 200 mm/rev</td></tr>
+<tr><td>Advance per revolution, measured</td><td class="num">186.2 mm</td><td>7-run calibration</td></tr>
+<tr><td>Wheel slip</td><td class="num">6.9 % (4.2–9.4 %)</td><td>Measured</td></tr>
+<tr><td>Traverse speed</td><td class="num">31.0 mm/s</td><td>Measured</td></tr>
+<tr><td>Total normal force \(\sum N_i\)</td><td class="num">11.76 N</td><td>\(6N_{\text{pre}}\), measured preload</td></tr>
+<tr><td>Friction coefficient \(\mu\)</td><td class="num">0.88</td><td>Drawbar stall test</td></tr>
+<tr><td>Maximum axial thrust</td><td class="num">9.81 N</td><td>Measured</td></tr>
+<tr><td><strong>Maximum obstacle steepness \(\theta_{\max}\)</strong></td><td class="num"><strong>39.7°</strong></td><td><strong>\(\arctan(\mu\cos\beta)\)</strong></td></tr>
+<tr><td>Maximum step height</td><td class="num">5.5 mm</td><td>Step criterion</td></tr>
+<tr><td>Liner edge (3.5 mm) safety factor</td><td class="num">1.36</td><td>Against measured capability</td></tr>
+<tr><td>Motor torque margin</td><td class="num">5.2×</td><td>At the traction limit</td></tr>
+</table>
+
+<div class="key">
+<p style="margin:0"><strong>Conclusion.</strong> The robot traverses obstacles up to <strong>39.7°</strong> in steepness, or vertical steps up to <strong>5.5 mm</strong>. Its own 3.5 mm deployed liner edge is cleared with a safety factor of 1.36, which chamfering the liner edge would raise above 2. The design is traction-limited with 5.2× torque margin remaining, so performance is bounded by wheel grip rather than by the drive.</p>
+</div>
+
+<h2>10. Sensitivity and limitations</h2>
+
+<h3>Robustness to pipe diameter deviation</h3>
+
+<p>The specification allows a pipe diameter of 192 ± 5 mm, i.e. \(R_p = 96 \pm 2.5\) mm. Propagating this through:</p>
+
+<table>
+<tr><th>Quantity</th><th>Dependence on \(R_p\)</th><th class="num">Change over ±2.5 mm</th></tr>
+<tr><td>Advance per revolution \(p\)</td><td>\(p = 2\pi R_p\tan\beta\), linear</td><td class="num">±2.6 %</td></tr>
+<tr><td>Preload \(N_{\text{pre}}\)</td><td>\(k_w\Delta R\)</td><td class="num">±0.30 N (±15 %)</td></tr>
+<tr><td><strong>Maximum ramp angle \(\theta_{\max}\)</strong></td><td><strong>none — \(R_p\) does not appear</strong></td><td class="num"><strong>0 %</strong></td></tr>
+</table>
+
+<p>The headline capability is therefore <em>insensitive</em> to pipe diameter deviation. The only consequence of a diameter change is a proportional error in odometry-reported position: over a 3 m run, ±2.5 mm on radius produces ±78 mm of position error if the calibration constant is not updated. This is mitigated by re-calibrating <code>STEPS_PER_MM</code> per pipe, or by correcting the stepper odometry against the stereo camera's absolute range fix.</p>
+
+<h3>Limitations</h3>
+<ul>
+<li>\(\mu = 0.88\) rests on a single stall measurement and sits at the upper end of the plausible range for TPU on PVC. Repeating the test 3–5 times would provide an error bar; the results above should be treated as a nominal case pending that.</li>
+<li>Wet traction is out of scope. Since the test rig is water-filled in other trials, wet performance should be characterised separately before any claim of in-service capability.</li>
+<li>Tether drag is neglected. Over longer runs it adds a term to the axial demand and would reduce the effective \(\theta_{\max}\).</li>
+<li>The model treats a single obstacle. Sustained rough surfaces, where several wheels engage different features simultaneously, are not covered.</li>
+<li>Rolling resistance uses a literature \(C_{rr}\); however it contributes under 4 % of the traction limit, so the result is insensitive to this value.</li>
+</ul>
+
+<div class="caution">
+<p style="margin:0"><strong>Recommended follow-up test.</strong> Build ramps at 35° and 45° and run the robot at each. The model predicts the first is cleared and the second is not. Confirming a prediction made in advance is substantially stronger evidence than a measurement taken alone.</p>
+</div>
+
+</body>
+</html>

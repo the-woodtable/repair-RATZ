@@ -221,6 +221,24 @@ class StereoCalib:
 # Worker
 # --------------------------------------------------------------------------
 
+class Shown:
+    """One detection, ready to draw and to hand to the auto sequence.
+
+    Named fields rather than a tuple because auto_sequence.py needs .conf,
+    .track_id and .label by name, and track_id is what stops the same crack
+    being screenshotted on every frame.
+    """
+
+    __slots__ = ("mask_xy", "label", "conf", "dist_mm", "track_id")
+
+    def __init__(self, mask_xy, label, conf, dist_mm, track_id):
+        self.mask_xy = mask_xy
+        self.label = label
+        self.conf = conf
+        self.dist_mm = dist_mm
+        self.track_id = track_id
+
+
 class CVWorker(threading.Thread):
     """Runs YOLO on the LEFT frame and SGBM on the pair, off the GUI thread.
 
@@ -317,7 +335,8 @@ class CVWorker(threading.Thread):
                 for det in dets:
                     cx, cy = det.centroid
                     dist = self.calib.distance_mm(disp, cx, cy) if disp is not None else None
-                    out.append((det.mask_xy, det.label, det.conf, dist))
+                    out.append(Shown(det.mask_xy, det.label, det.conf, dist,
+                                     det.track_id))
                 with self._out_lock:
                     self.detections = out
                     self.infer_ms = (time.time() - t0) * 1000
@@ -362,22 +381,22 @@ def draw_detections(frame_bgr, detections):
         return frame_bgr
     out = frame_bgr.copy()
     overlay = out.copy()
-    for mask_xy, label, conf, dist in detections:
-        pts = np.asarray(mask_xy, dtype=np.int32).reshape(-1, 1, 2)
+    for d in detections:
+        pts = np.asarray(d.mask_xy, dtype=np.int32).reshape(-1, 1, 2)
         cv2.fillPoly(overlay, [pts], MASK_COLOR)
         cv2.polylines(out, [pts], True, MASK_COLOR, 2)
     cv2.addWeighted(overlay, 0.35, out, 0.65, 0, out)
 
-    for mask_xy, label, conf, dist in detections:
-        pts = np.asarray(mask_xy, dtype=np.int32)
+    for d in detections:
+        pts = np.asarray(d.mask_xy, dtype=np.int32)
         x, y = int(pts[:, 0].min()), int(pts[:, 1].min())
         # Always show a distance field, even when it could not be measured.
         # Omitting it silently made a working stereo pipeline look broken:
         # you cannot tell "no distance" from "this label has no distance".
         # "-- cm" means the crack is nearer than the minimum range, sitting
         # in the left dead zone, or on a surface too smooth for SGBM.
-        txt = f"{label} {conf:.2f}"
-        txt += f"  {dist / 10.0:.1f} cm" if dist is not None else "  -- cm"
+        txt = f"{d.label} {d.conf:.2f}"
+        txt += f"  {d.dist_mm / 10.0:.1f} cm" if d.dist_mm is not None else "  -- cm"
         (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
         y = max(y, th + 6)
         cv2.rectangle(out, (x, y - th - 6), (x + tw + 6, y), MASK_COLOR, -1)
