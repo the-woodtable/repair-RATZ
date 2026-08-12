@@ -17,8 +17,8 @@ this one when people are watching.
     python3 rat88_panel.py --conf 0.55           # detection threshold
     python3 rat88_panel.py --list                # show ports and exit
 
-Crack detection runs on the LEFT camera only and distance comes from the
-stereo disparity map, so the right pane stays cheap. See showcase_cv.py.
+Crack detection runs on BOTH cameras independently (redundancy, not stereo
+depth). Camera-distance was removed -- see showcase_cv.py.
 
 Wire format in  (from stereo_serial.py / main.cpp):
     0xAA 0x55 | ID(1) | uint32 LE length | payload
@@ -39,9 +39,14 @@ Three different kinds of hardware, so three different kinds of control:
     DRIVE     Stepper::setDrive has NO timeout. It runs until told 'S', so the
               arrows are press-and-hold and send 'S' on release, on
               mouse-leave, and when the window loses focus.
-    LINING    An actuator - a motor that runs. Actuator::update() cuts it
-              after MAX_RUN_MS (10s, THIS ONE/include/Actuator.h). One click
-              starts a move; the firmware ends it.
+    LINING    An actuator - a motor that runs, with NO position feedback and
+              NO limit switch in firmware (setActuator() just sets a mode
+              flag and runs until told 'X' -- confirmed against main.cpp).
+              One click here starts a move; THIS PANEL ends it after
+              ACT_RUN_S seconds via a software timer (see on_lining), the
+              same fixed-duration approach auto_sequence.py uses for the
+              automatic deploy/retract steps. It is NOT the firmware ending
+              it -- there is no such firmware behaviour to rely on.
     HOOK,     Servos. setAngle drives them to a position and holds. Nothing
     SPOOL     to stop and no timer needed; one click parks them.
 """
@@ -250,8 +255,10 @@ HOOK_BOOT = "H"
 # The can and the spool are separate mechanisms on separate hardware, so each
 # is its own two-state button rather than a pair that fight over one motor.
 #
-# LINING is the actuator (a motor). 'D' extends it, 'R' pulls it back, and
-# Actuator::update() cuts power after ACT_RUN_S either way.
+# LINING is the actuator (a motor). 'D' extends it, 'R' pulls it back. There
+# is NO firmware timeout -- confirmed against main.cpp's setActuator(), which
+# just sets a mode flag and runs until 'X'. on_lining() below enforces
+# ACT_RUN_S in software so a manual click cannot run the motor forever.
 #
 # SPOOL is a servo of its own on PIN_SPOOL (main.cpp lines 152-153):
 #     case 'T': spoolServo.setAngle(180)
@@ -332,10 +339,13 @@ SOI, EOI = b"\xFF\xD8", b"\xFF\xD9"
 # the string loops. Blocks F/B whenever the hook is in the 'H' position.
 INTERLOCK_HOOK_BLOCKS_DRIVE = False
 
-# Must match Actuator::MAX_RUN_MS in "THIS ONE/include/Actuator.h" (10000 ms).
-# The firmware is what actually stops the motor; this is only for the on-screen
-# countdown. If you change one, change the other.
-ACT_RUN_S = 10.0
+# How long a manual DEPLOY/RETRACT click runs the actuator before this panel
+# sends 'X' itself. Firmware has no auto-stop (see the LINING comment above),
+# so this software timer is what actually protects the motor -- it is not
+# just a countdown display. MUST match auto_sequence.ACTUATOR_RUN_SECS, which
+# is what the automatic sequence uses for the same motor. Sourced from there
+# directly below so the two can't drift apart.
+ACT_RUN_S = auto.ACTUATOR_RUN_SECS if HAVE_AUTO else 13.0
 
 _TELEM_RE = re.compile(r'"?(\w+)"?\s*[:=]\s*(-?\d+(?:\.\d+)?)')
 
@@ -623,6 +633,9 @@ class _HeadlessToggleButton:
         return bool(self.sel)
 
     def setToolTip(self, _t):
+        pass
+
+    def setEnabled(self, _on):
         pass
 
 
@@ -1125,6 +1138,7 @@ class Panel(QWidget):
         self.hook_pos = HOOK_BOOT    # HookServo::begin parks at 180 == 'H'
         self.act_until = 0.0
         self.act_dir = ""
+        self._act_timer = None          # QTimer: software auto-stop for manual clicks
         # LED::begin() leaves the lamp off with full brightness remembered, so
         # the slider sits at 9 while the lamp reads "off". Both are true.
         self.led_on = LED_BOOT_ON
@@ -1144,24 +1158,23 @@ class Panel(QWidget):
         self._telem = {}
         self._telem_seen = 0.0
         self.link_text = "starting"
-        self._det_count = 0
-        self._nearest = None
-        self._dets = []
+        self._det_count_l = 0
+        self._det_count_r = 0
+        self._dets_l = []
+        self._dets_r = []
 
         # CV is optional at every level: missing opencv, missing ultralytics,
-        # missing CV.pt and missing stereo_calib.npz each degrade separately
-        # rather than stopping the panel from opening.
+        # and missing CV.pt each degrade separately rather than stopping the
+        # panel from opening. There is no stereo calibration any more --
+        # camera-distance was removed as unreliable, same as
+        # control_panel_stereo2.py.
         self.cv = None
         self.cv_note = CV_IMPORT_ERROR or ""
         if self._use_cv:
             self.cv = scv.CVWorker(conf=self._conf)
             self.cv.start()
-            notes = []
             if self.cv.cv_error:
-                notes.append(self.cv.cv_error)
-            if not self.cv.calib.ok:
-                notes.append(self.cv.calib.error or "no calibration")
-            self.cv_note = "  |  ".join(notes)
+                self.cv_note = self.cv.cv_error
 
         self._build_background()
         self._build_video()
@@ -1263,8 +1276,10 @@ class Panel(QWidget):
         can_btn.setToolTip(
             f"Lining actuator — click to deploy ('{LINING[1]}'), "
             f"click again to retract ('{LINING[0]}').\n"
-            f"Firmware cuts the motor after {ACT_RUN_S:.0f}s either way.\n"
-            "Space stops it immediately.")
+            f"This panel cuts the motor after {ACT_RUN_S:.0f}s either way "
+            "(firmware has no timeout of its own).\n"
+            "Space stops it immediately. Disabled while an automatic "
+            "sequence is running.")
         self.lining = Toggle(can_btn, LINING, self.on_lining)
 
         # The spool lost its artwork but not its servo, so it keeps a Toggle
@@ -1380,6 +1395,14 @@ class Panel(QWidget):
         self._last_cmd = ch
 
     def drive(self, ch: str):
+        """Manual drive. Ignored while the automatic sequence owns the
+        motor (same rule as control_panel_stereo2.py's guard_auto), so a
+        held arrow key can't fight the sequence's own F/B/S commands. The
+        buttons are additionally disabled while busy (see sync_run_buttons),
+        so this mostly guards the keyboard path."""
+        if self.auto and self.auto.running:
+            self._last_cmd = "blocked: auto sequence running"
+            return
         if INTERLOCK_HOOK_BLOCKS_DRIVE and self.hook_pos == "H":
             self._last_cmd = "blocked: hook out"
             return
@@ -1394,14 +1417,32 @@ class Panel(QWidget):
     def on_lining(self, ch: str, on: bool):
         """Lining actuator: 'D' deploys, 'R' retracts.
 
-        This is a MOTOR, so the move takes real time. act_until is a countdown
-        display only - it does not stop anything. Actuator::update() on the
-        ESP32 is what cuts the power, after MAX_RUN_MS. We mirror the same
-        duration here purely so the status line can show how long is left.
+        Firmware has NO timeout of its own (confirmed against main.cpp's
+        setActuator() -- it is just a mode flag, motion only stops on 'X').
+        So THIS is what stops the motor for a manual click: a real QTimer
+        that fires 'X' after ACT_RUN_S seconds. act_until/act_dir remain for
+        the on-screen countdown text, but they are no longer purely
+        cosmetic -- _act_timer is the thing that actually protects the motor.
+
+        Any previous pending timer is cancelled first, so quickly toggling
+        deploy/retract can't leave two timers racing to send 'X'.
         """
         self.send(ch)
+        if self._act_timer is not None:
+            self._act_timer.stop()
+        self._act_timer = QTimer(self)
+        self._act_timer.setSingleShot(True)
+        self._act_timer.timeout.connect(self._act_timeout)
+        self._act_timer.start(int(ACT_RUN_S * 1000))
         self.act_until = time.time() + ACT_RUN_S
         self.act_dir = "deploying" if on else "retracting"
+
+    def _act_timeout(self):
+        """Fires ACT_RUN_S after a manual DEPLOY/RETRACT click. Sends 'X'
+        for real -- see on_lining's docstring for why this can't be skipped."""
+        self.send("X")
+        self.act_dir = "stopped"
+        self.act_until = 0.0
 
     def on_spool(self, ch: str, on: bool):
         """Spool servo: 'T' winds in (180 deg), 'Y' pays out (90 deg).
@@ -1451,7 +1492,8 @@ class Panel(QWidget):
             self.stop_all()
 
     def sync_run_buttons(self):
-        """Keep the pair honest.
+        """Keep the pair honest, and lock out manual drive/lining while the
+        sequence owns the robot.
 
         The sequence can end on its own - it finishes a lining, it reaches
         home, it loses telemetry - and the space bar and losing window focus
@@ -1460,10 +1502,20 @@ class Panel(QWidget):
 
         set_selected, not choose: this reflects state, it must not re-issue
         the command.
+
+        Disabling btn_fwd/btn_back/the lining button while busy is the same
+        rule control_panel_stereo2.py enforces (manual FWD/BACK/DEPLOY/RETRACT
+        guarded by "auto_state != IDLE") -- there it's a guard inside the
+        click handler; here it's simpler to just grey the buttons out, which
+        also makes it visually obvious on stage that manual control is locked.
         """
-        want = "start" if (self.auto and self.auto.running) else "stop"
+        busy = bool(self.auto and self.auto.running)
+        want = "start" if busy else "stop"
         if self.run.selected() != want:
             self.run.set_selected(want)
+        self.btn_fwd.setEnabled(not busy)
+        self.btn_back.setEnabled(not busy)
+        self.lining.button.setEnabled(not busy)
 
     def auto_start(self):
         if not self.auto:
@@ -1535,11 +1587,20 @@ class Panel(QWidget):
         the button back would claim a position the hardware is not in. The
         status line says "stopped" instead. Servos are not touched - they are
         already parked and holding.
+
+        Also cancels the manual actuator timer, if one is pending -- this may
+        have been called mid a manual DEPLOY/RETRACT click, and without this
+        _act_timeout would still fire later and send an unexpected 'X'
+        (harmless since 'X' is already what stop_all wants, but the countdown
+        text would otherwise keep counting down after a panic stop).
         """
         # Cancel the sequence FIRST. Otherwise its next tick would happily
         # re-send 'F' and the robot would carry on after the panic button.
         if self.auto:
             self.auto.stop()
+        if self._act_timer is not None:
+            self._act_timer.stop()
+            self._act_timer = None
         self.send("S")
         self.link.send("X")
         self.act_until = 0.0
@@ -1619,33 +1680,35 @@ class Panel(QWidget):
         if bgr is None:
             return
 
-        # Rectify on arrival so display, detection and disparity all share one
-        # coordinate space. Looking up a raw-image centroid in a rectified
-        # disparity map returns a confidently wrong distance.
-        if self.cv and self.cv.calib.ok:
-            bgr = self.cv.calib.rectify_one(bgr, cam)
-
+        # Detection runs on BOTH cameras independently -- redundancy, not
+        # stereo depth. There is no rectification step any more: camera
+        # distance was removed as unreliable, so frames no longer need a
+        # shared rectified coordinate space.
         if self.cv:
             self.cv.submit(bgr if cam == "L" else None,
                            bgr if cam == "R" else None)
-            if cam == "L":
-                dets, _, _ = self.cv.latest()
-                self._dets = dets          # the sequence reads these on tick
-                if dets:
-                    bgr = scv.draw_detections(bgr, dets)
-                    self._det_count = len(dets)
-                    self._nearest = min(
-                        (d.dist_mm for d in dets if d.dist_mm is not None),
-                        default=None)
-                    # Screenshot AFTER drawing, so the saved image carries the
-                    # outline and label. The sequence decides whether this one
-                    # is worth keeping and whether it has been seen before.
-                    if self.auto:
-                        for d in dets:
-                            self.auto.maybe_capture(bgr, d, cam)
+            dets_l, dets_r, _ = self.cv.latest()
+            self._dets_l, self._dets_r = dets_l, dets_r
+            dets = dets_l if cam == "L" else dets_r
+            if dets:
+                bgr = scv.draw_detections(bgr, dets)
+                if cam == "L":
+                    self._det_count_l = len(dets)
                 else:
-                    self._det_count = 0
-                    self._nearest = None
+                    self._det_count_r = len(dets)
+                # Screenshot AFTER drawing, so the saved image carries the
+                # outline and label. The sequence decides whether this one
+                # is worth keeping and whether it has been seen before.
+                # tag=cam matches control_panel_stereo2.py's "L"/"R" tags,
+                # so track IDs from each camera stay in separate ID spaces.
+                if self.auto:
+                    for d in dets:
+                        self.auto.maybe_capture(bgr, d, cam)
+            else:
+                if cam == "L":
+                    self._det_count_l = 0
+                else:
+                    self._det_count_r = 0
 
         pane.show_frame(bgr_to_qimage(bgr))
 
@@ -1668,8 +1731,10 @@ class Panel(QWidget):
 
         # Drive the sequence from the ticker rather than from frame arrival,
         # so a stall in the video cannot leave a homing run going forever.
+        # Detections from BOTH cameras go in, same as control_panel_stereo2's
+        # self._auto_step(det_l + det_r, now).
         if self.auto and self.auto.running:
-            self.auto.step(self._dets, now)
+            self.auto.step(self._dets_l + self._dets_r, now)
         self.sync_run_buttons()
 
         age = now - self._telem_seen
@@ -1695,10 +1760,9 @@ class Panel(QWidget):
         if self.cv_note:
             cv_txt = self.cv_note
         elif self.cv:
-            _, infer_ms, depth_ms = self.cv.latest()
-            near = f"{self._nearest / 10.0:.1f}cm" if self._nearest else "--"
-            cv_txt = (f"cracks={self._det_count} nearest={near} "
-                      f"yolo={infer_ms:.0f}ms sgbm={depth_ms:.0f}ms")
+            _, _, infer_ms = self.cv.latest()
+            cv_txt = (f"cracks L={self._det_count_l} R={self._det_count_r} "
+                      f"yolo={infer_ms:.0f}ms")
         else:
             cv_txt = "cv off"
 
@@ -1724,6 +1788,8 @@ class Panel(QWidget):
         """Runs whether or not the status strip is shown. Without it the drive
         motor keeps running after the window shuts: link.stop() sends S and X."""
         self.ticker.stop()
+        if self._act_timer is not None:
+            self._act_timer.stop()
         if self.cv:
             self.cv.stop()
         self.link.stop()
@@ -1747,7 +1813,7 @@ def main():
     ap.add_argument("--width", type=int, default=None,
                     help="explicit width; height follows the 4:3 design")
     ap.add_argument("--no-cv", action="store_true",
-                    help="skip YOLO and stereo depth")
+                    help="skip YOLO detection")
     ap.add_argument("--conf", type=float, default=0.4,
                     help="detection confidence threshold")
     ap.add_argument("--list", action="store_true")

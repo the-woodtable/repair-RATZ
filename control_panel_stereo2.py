@@ -94,7 +94,7 @@ CV_CONF = 0.4
 # controls the much bigger decision of "stop and reposition for a human to
 # look at this" -- a false positive here wastes travel distance and an
 # operator's attention, so it's set high on purpose.
-AUTO_DEPLOY_CONF = 0.8
+AUTO_DEPLOY_CONF = 0.75
 # Lower bar: a detection needs at least this much confidence to make the
 # robot stop and take a closer look at all. Below this, it's ignored and
 # scanning continues -- only detections at or above this get a second look.
@@ -125,7 +125,7 @@ AUTO_PAUSE_SETTLE_TICKS = 5
 # Then average confidence over this many ticks before deciding. Averaging
 # beats trusting a single frame, since a single frame can spike or drop from
 # lighting flicker or a partial view of the crack.
-AUTO_PAUSE_CONFIRM_TICKS = 8
+AUTO_PAUSE_CONFIRM_TICKS = 15
 # Fallback conversion if telemetry ever has 'steps' but no 'pos_mm' -- from
 # the calibration run: 2352 steps measured over 730mm of travel.
 STEPS_PER_MM_FALLBACK = 2352 / 730.0
