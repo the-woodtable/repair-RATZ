@@ -1684,6 +1684,11 @@ class Panel(QWidget):
         else:
             motor = ""
 
+        # BEFORE the SHOW_STATUS gate. The odometer is part of the panel
+        # artwork, not part of the debug strip, so it has to keep updating
+        # when the strip is hidden.
+        self.update_odometer()
+
         if not SHOW_STATUS:
             return
 

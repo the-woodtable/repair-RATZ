@@ -169,6 +169,7 @@ def make_panel():
         zero_odometer = R.Panel.zero_odometer
         update_odometer = R.Panel.update_odometer
         keyPressEvent = R.Panel.keyPressEvent
+        refresh_status = R.Panel.refresh_status
 
     p = P()
     P.sent = []
@@ -546,6 +547,49 @@ def _():
         assert p.odo.t == "38.3", "fresh reading did not come back"
     finally:
         R.ODO_STALE_S = saved
+
+
+@check("odometer: the tick actually calls it")
+def _():
+    # This is the bug that made the readout sit at "--" forever: the method
+    # existed and was correct, but nothing ever called it. Testing the maths
+    # in isolation could not catch that, so drive the real tick instead.
+    p = make_panel()
+    p.status = FakeLabel()
+    p.link_text = "SIM"
+    p.link.fps = {"L": 0.0, "R": 0.0}
+    p.cv = None
+    p.cv_note = ""
+    p.auto_status = "idle"
+    p._det_count = 0
+    p._nearest = None
+    p.on_telemetry('{"pos_mm":456.0}')
+    assert p.odo.t in ("", "--"), "precondition: readout not yet written"
+    R.Panel.refresh_status(p)
+    assert p.odo.t == "45.6", \
+        f"refresh_status did not update the odometer (got {p.odo.t!r})"
+
+
+@check("odometer: still updates with the status strip hidden")
+def _():
+    p = make_panel()
+    p.status = FakeLabel()
+    p.link_text = "SIM"
+    p.link.fps = {"L": 0.0, "R": 0.0}
+    p.cv = None
+    p.cv_note = ""
+    p.auto_status = "idle"
+    p._det_count = 0
+    p._nearest = None
+    p.on_telemetry('{"pos_mm":789.0}')
+    saved = R.SHOW_STATUS
+    try:
+        R.SHOW_STATUS = False
+        R.Panel.refresh_status(p)
+        assert p.odo.t == "78.9", \
+            "the odometer stopped updating when the debug strip was hidden"
+    finally:
+        R.SHOW_STATUS = saved
 
 
 @check("odometer: Z key and clicking the readout do the same thing")
