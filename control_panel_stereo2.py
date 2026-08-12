@@ -59,6 +59,18 @@ REC_DIR     = os.path.join(DATA_DIR, "recordings")
 DATASET_DIR = os.path.join(DATA_DIR, "dataset")
 CALIB_DIR   = os.path.join(DATA_DIR, "calib_pairs")
 
+# Ambiguous-crack review: confirmed detections with confidence in this range
+# are screenshotted for a human to double-check later -- above
+# AUTO_PAUSE_TRIGGER_CONF (0.5, worth a closer look) but below AUTO_DEPLOY_CONF
+# (0.8, confident enough to act on automatically). One screenshot per crack ID.
+SCREENSHOT_CONF_MIN = 0.4
+SCREENSHOT_CONF_MAX = 0.79
+# Screenshots only happen while a scan is actively running, from START
+# through the lining being deployed -- not while idle/manually driving, and
+# not once POST_DEPLOY_WAIT/RETRACTING_AUTO/RETURNING_HOME start (deployed).
+SCREENSHOT_ACTIVE_STATES = frozenset(
+    {"SCANNING", "PAUSED", "REPOSITIONING", "PRE_DEPLOY_WAIT", "DEPLOYING"})
+
 REC_FPS      = 10
 AUTOCAP_SECS = 1.0
 PAIR_MAX_AGE = 0.30    # L/R further apart than this = unsynced
@@ -74,7 +86,7 @@ MAX_COLOUR_JUMP = 45.0
 
 # Crack/hole detection model. Set to your trained weights path.
 CV_MODEL_PATH = os.path.join(HERE, "CV.pt")
-CV_CONF = 0.2
+CV_CONF = 0.4
 
 # ---- autonomous scan loop ----
 # This is a SEPARATE, higher bar than CV_CONF above. CV_CONF (and the "conf"
@@ -93,18 +105,16 @@ AUTO_REPOSITION_MM = 30.0
 PRE_DEPLOY_WAIT_SECS = 5.0
 # Wait after the lining is fully deployed, before retracting.
 POST_DEPLOY_WAIT_SECS = 5.0
-# "Deploy/retract finished" is detected generically, without needing to know
-# what main.cpp's actuator.getState() numbers actually mean: once telemetry's
-# "actuator" field stops CHANGING for this many seconds, the actuator is
-# assumed to have stopped moving (fully extended/retracted, or stalled at
-# the limit). Used for BOTH the deploy and the retract half of the sequence.
-ACTUATOR_STABLE_SECS = 0.5
-# Safety cap regardless of the above, in case the actuator field never
-# settles for some reason -- don't wait forever.
-ACTUATOR_TIMEOUT_SECS = 8.0
-# If telemetry has no "actuator" field at all, there's nothing to watch --
-# just wait this long and assume the move finished.
-ACTUATOR_NO_TELEM_WAIT_SECS = 3.0
+# How long to run the actuator for a full deploy or retract, in seconds.
+# main.cpp's actuator.getState() (telemetry's "actuator" field) is only a
+# mode flag -- 0 idle, +1 extending, -1 retracting -- that goes still the
+# INSTANT motion starts, not when it finishes; there's no position feedback
+# or limit switch. So completion can't be detected, only timed. Measured
+# both deploy and retract at exactly 10s (stopwatch, current ACT_SPEED) --
+# this adds a 3s margin so a slightly slower run still finishes. Re-measure
+# and adjust if ACT_SPEED changes, or split into two constants if deploy and
+# retract ever need different durations.
+ACTUATOR_RUN_SECS = 13.0
 # How close to "home" (position 0, i.e. wherever ZERO ODOM was last pressed)
 # counts as arrived, when driving back via the RETURN HOME button, in mm.
 HOME_TOLERANCE_MM = 2.0
@@ -193,6 +203,23 @@ def find_port():
         print("Serial devices seen:", ", ".join(p.device for p in ports))
         print(f"Using {native[0]} — set PORT at the top to override.")
     return native[0]
+
+
+def next_numbered_dir(base_dir, prefix):
+    """Creates and returns base_dir/"{prefix} (N)" for the smallest N not
+    already used -- so each run of the panel gets its own fresh, numbered
+    folder instead of overwriting or mixing with a previous run's files."""
+    os.makedirs(base_dir, exist_ok=True)
+    pattern = re.compile(re.escape(prefix) + r" \((\d+)\)$")
+    used = []
+    for name in os.listdir(base_dir):
+        m = pattern.match(name)
+        if m:
+            used.append(int(m.group(1)))
+    n = max(used, default=0) + 1
+    path = os.path.join(base_dir, f"{prefix} ({n})")
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 class FrameLink:
@@ -653,10 +680,7 @@ class App:
         self._auto_pause_ticks = 0
         self._reposition_start_mm = None
         self._wait_started_t = None       # PRE_/POST_DEPLOY_WAIT timers
-        self._act_label = ""              # "deploying" / "retracting", for the status line
-        self._act_last_val = None         # last seen telemetry "actuator" value
-        self._act_last_change_t = None
-        self._act_started_t = None
+        self._act_started_t = None        # DEPLOYING/RETRACTING_AUTO run timer
         self.start_btn = tk.Button(rob, text="▶ START", width=10,
                                    command=self._toggle_auto)
         self.start_btn.grid(row=0, column=5, padx=3, pady=3)
@@ -684,7 +708,7 @@ class App:
                                   bg="#1e1e1e", fg="#ccc", highlightthickness=0,
                                   troughcolor="#333", length=200,
                                   command=self._on_led_scale)
-        self.led_scale.set(4)
+        self.led_scale.set(0)
         self.led_scale.grid(row=2, column=1, columnspan=3, sticky="w")
 
         # Telemetry echo — confirms the S3 heard you. If you press LED ON and
@@ -734,6 +758,13 @@ class App:
         self._fps_base = (0, 0)
         for d in (REC_DIR, DATASET_DIR, CALIB_DIR):
             os.makedirs(d, exist_ok=True)
+
+        # Ambiguous-crack review screenshots -- a fresh numbered folder each
+        # run, e.g. "Pipe Inspection (3)" if (1) and (2) already exist.
+        self.inspection_dir = next_numbered_dir(DATA_DIR, "Pipe Inspection")
+        self._screenshotted_ids = set()   # {(tag, track_id)} already saved this run
+        print(f"ambiguous-crack screenshots (conf {SCREENSHOT_CONF_MIN}-"
+              f"{SCREENSHOT_CONF_MAX}) -> {self.inspection_dir}")
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._release_jobs = {}   # per-key debounce timers, see _key_up()
@@ -913,31 +944,10 @@ class App:
                 return float(t["steps"]) / STEPS_PER_MM_FALLBACK
         return None
 
-    def _actuator_settled(self, now):
-        """True once telemetry's "actuator" field has stopped changing for
-        ACTUATOR_STABLE_SECS (or a safety timeout / no-telemetry fallback
-        has elapsed) -- used to detect "fully deployed" and "fully
-        retracted" without needing to know what the numbers actually mean.
-        Also updates the status label. Caller must have set
-        self._act_label/_act_last_val/_act_last_change_t/_act_started_t
-        when entering the watching state."""
-        with self.link.lock:
-            val = self.link.telem.get("actuator")
-        if val is None:
-            elapsed = now - self._act_started_t
-            self.lbl_auto.config(
-                text=f"AUTO: {self._act_label} (no actuator telemetry, {elapsed:.1f}s)",
-                fg="#e8a33d")
-            return elapsed >= ACTUATOR_NO_TELEM_WAIT_SECS
-        if self._act_last_val is None or val != self._act_last_val:
-            self._act_last_val = val
-            self._act_last_change_t = now
-        stable_for = now - self._act_last_change_t
-        self.lbl_auto.config(
-            text=f"AUTO: {self._act_label} (actuator={val}, stable {stable_for:.1f}s)",
-            fg="#8cf")
-        timed_out = (now - self._act_started_t) >= ACTUATOR_TIMEOUT_SECS
-        return stable_for >= ACTUATOR_STABLE_SECS or timed_out
+    def _actuator_time_left(self, now):
+        """Seconds remaining in the current fixed-duration actuator run
+        (deploy or retract), started when self._act_started_t was set."""
+        return max(0.0, ACTUATOR_RUN_SECS - (now - self._act_started_t))
 
     def _auto_step(self, detections, now):
         """Runs once per _tick(). `detections` is this frame's combined
@@ -1022,14 +1032,15 @@ class App:
             if elapsed >= PRE_DEPLOY_WAIT_SECS:
                 self.auto_state = "DEPLOYING"
                 self.link.send("D")
-                self._act_label = "deploying"
-                self._act_last_val = None
-                self._act_last_change_t = now
                 self._act_started_t = now
             return
 
         if self.auto_state == "DEPLOYING":
-            if self._actuator_settled(now):
+            remaining = self._actuator_time_left(now)
+            self.lbl_auto.config(
+                text=f"AUTO: deploying ({remaining:.1f}s left)", fg="#8cf")
+            if remaining <= 0:
+                self.link.send("X")
                 self.auto_state = "POST_DEPLOY_WAIT"
                 self._wait_started_t = now
             return
@@ -1042,21 +1053,22 @@ class App:
             if elapsed >= POST_DEPLOY_WAIT_SECS:
                 self.auto_state = "RETRACTING_AUTO"
                 self.link.send("R")
-                self._act_label = "retracting"
-                self._act_last_val = None
-                self._act_last_change_t = now
                 self._act_started_t = now
             return
 
         if self.auto_state == "RETRACTING_AUTO":
-            if self._actuator_settled(now):
-                self.link.send("X")   # explicit stop, safe even if already done
+            remaining = self._actuator_time_left(now)
+            self.lbl_auto.config(
+                text=f"AUTO: retracting ({remaining:.1f}s left)", fg="#8cf")
+            if remaining <= 0:
+                self.link.send("X")
                 self.auto_state = "IDLE"
                 self.start_btn.config(text="▶ START", bg="#d9d9d9", fg="black")
                 self.lbl_auto.config(
                     text="AUTO: sequence complete -- manual control (or RETURN HOME)",
                     fg="#ccc")
             return
+
 
         if self.auto_state == "RETURNING_HOME":
             # Deliberately ignores `detections` entirely -- once homing has
@@ -1308,6 +1320,42 @@ class App:
             cv_lines.append(f"{tag} ID{det.track_id}  {det.label:<6}"
                            f"  conf {det.conf:.2f}")
 
+    def _maybe_capture_crack(self, vis_img, det, tag):
+        """Saves one screenshot for this crack ID the first time its
+        confidence falls in the SCREENSHOT_CONF_MIN-MAX review range, AND
+        the auto sequence is actively running (SCREENSHOT_ACTIVE_STATES) --
+        cracks the auto system isn't confident enough to act on (below
+        AUTO_DEPLOY_CONF) but that are worth a human double-checking
+        (at or above AUTO_PAUSE_TRIGGER_CONF). vis_img must already have
+        this detection's outline/label drawn on it (see _draw_detections).
+        Checked before the already-seen mark, so a crack skipped while
+        idle/manual can still be captured on a later active run.
+        """
+        if self.auto_state not in SCREENSHOT_ACTIVE_STATES:
+            return
+        if not (SCREENSHOT_CONF_MIN <= det.conf <= SCREENSHOT_CONF_MAX):
+            return
+        key = (tag, det.track_id)
+        if key in self._screenshotted_ids:
+            return
+        self._screenshotted_ids.add(key)
+
+        pos = self._current_pos_mm()
+        pos_txt = f"{pos:.0f}mm" if pos is not None else "unknown"
+
+        img = vis_img.copy()
+        h, w = img.shape[:2]
+        caption = f"{tag}{det.track_id} {det.label} conf {det.conf:.2f}  traveled {pos_txt}"
+        cv2.rectangle(img, (0, h - 20), (w, h), (0, 0, 0), -1)
+        cv2.putText(img, caption, (4, h - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                   (0, 255, 255), 1, cv2.LINE_AA)
+
+        fname = f"crack_{tag}{det.track_id}_conf{det.conf:.2f}_pos{pos_txt}.png"
+        path = os.path.join(self.inspection_dir, fname)
+        cv2.imwrite(path, img)
+        print(f"flagged for review: {tag}{det.track_id} conf {det.conf:.2f} "
+              f"@ {pos_txt} -> {path}")
+
     # ---- main loop ----
     def _tick(self):
         img_l, img_r = self.worker.snapshot()
@@ -1329,11 +1377,15 @@ class App:
         if img_l is not None:
             vis_l = img_l.copy()
             self._draw_detections(vis_l, det_l, cv_lines, "L")
+            for det in det_l:
+                self._maybe_capture_crack(vis_l, det, "L")
             self._show(self.lblL, vis_l)
 
         if img_r is not None:
             vis_r = img_r.copy()
             self._draw_detections(vis_r, det_r, cv_lines, "R")
+            for det in det_r:
+                self._maybe_capture_crack(vis_r, det, "R")
             self._show(self.lblR, vis_r)
 
         if (self.cv_tracker_l is not None or self.cv_tracker_r is not None) \

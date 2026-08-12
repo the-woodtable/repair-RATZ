@@ -269,7 +269,7 @@ LED_BOOT_LEVEL = 9         # LED::begin -> _bright = 255, which is '9'
 # character sent, crack count and distance, and the telemetry echo.
 # Prefer flipping this to commenting the code out: closeEvent lives in the same
 # block, and without it the drive motor keeps running after the window shuts.
-SHOW_STATUS = True
+SHOW_STATUS = False
 
 C_BG        = QColor("#E4E2DD")
 C_INK       = QColor("#1B4EA0")
