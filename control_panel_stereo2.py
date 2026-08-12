@@ -87,11 +87,27 @@ AUTO_DEPLOY_CONF = 0.8
 # robot stop and take a closer look at all. Below this, it's ignored and
 # scanning continues -- only detections at or above this get a second look.
 AUTO_PAUSE_TRIGGER_CONF = 0.5
-# How far to drive FORWARD, past a confirmed crack, before flagging DEPLOY, in mm.
-AUTO_REPOSITION_MM = 20.0
-# How close is "close enough" when driving back to the original position
-# after retracting -- odometry won't land on the target exactly, in mm.
-RETURN_TOLERANCE_MM = 2.0
+# How far to drive FORWARD, past a confirmed crack, before deploying, in mm.
+AUTO_REPOSITION_MM = 30.0
+# Wait after reaching the reposition point, before extending the actuator.
+PRE_DEPLOY_WAIT_SECS = 5.0
+# Wait after the lining is fully deployed, before retracting.
+POST_DEPLOY_WAIT_SECS = 5.0
+# "Deploy/retract finished" is detected generically, without needing to know
+# what main.cpp's actuator.getState() numbers actually mean: once telemetry's
+# "actuator" field stops CHANGING for this many seconds, the actuator is
+# assumed to have stopped moving (fully extended/retracted, or stalled at
+# the limit). Used for BOTH the deploy and the retract half of the sequence.
+ACTUATOR_STABLE_SECS = 0.5
+# Safety cap regardless of the above, in case the actuator field never
+# settles for some reason -- don't wait forever.
+ACTUATOR_TIMEOUT_SECS = 8.0
+# If telemetry has no "actuator" field at all, there's nothing to watch --
+# just wait this long and assume the move finished.
+ACTUATOR_NO_TELEM_WAIT_SECS = 3.0
+# How close to "home" (position 0, i.e. wherever ZERO ODOM was last pressed)
+# counts as arrived, when driving back via the RETURN HOME button, in mm.
+HOME_TOLERANCE_MM = 2.0
 # After stopping to look at a detection, wait this many ticks (40ms each)
 # before trusting any confidence reading -- the frame is still motion-blurred
 # from driving for the first few ticks after 'S' is sent.
@@ -614,34 +630,42 @@ class App:
                   highlightbackground="#8b0000",
                   command=self.stop_all).grid(row=0, column=2, padx=3, pady=3)
 
-        # Actuator: also hold-to-move, release stops. DEPLOY gets an
-        # on_press hook (operator clicked it) and RETRACT gets an on_release
-        # hook (operator finished retracting) -- both stored so the
-        # autonomous loop below can flash each one in turn and know when
-        # the operator has acted on it.
+        # Actuator: hold-to-move for MANUAL use. guard_auto=True means these
+        # ignore manual presses while the autonomous crack sequence owns the
+        # actuator (deploy/retract there are fully automatic -- see below) --
+        # otherwise a manual click mid-sequence could double-fire the motor.
         self.deploy_btn = self._hold_btn(rob, "DEPLOY", "D", "X", 0, 3,
-                                         on_press=self._on_deploy_pressed)
+                                         guard_auto=True)
         self.retract_btn = self._hold_btn(rob, "RETRACT", "R", "X", 0, 4,
-                                          on_release=self._on_retract_released)
+                                          guard_auto=True)
 
         # ---- autonomous scan ----
         # One button instead of manually toggling FWD/BACK: click START and
-        # the robot drives itself, stopping on its own to examine cracks.
-        # IDLE -> SCANNING -> PAUSED -> REPOSITIONING -> DEPLOY_READY
-        #      -> RETRACT_READY -> RETURNING -> IDLE
+        # the robot drives itself, stopping to examine cracks and running
+        # the whole deploy/retract sequence on its own once one is
+        # confirmed. Control is handed back to manual driving afterward.
+        #   IDLE -> SCANNING -> PAUSED -> REPOSITIONING -> PRE_DEPLOY_WAIT
+        #        -> DEPLOYING -> POST_DEPLOY_WAIT -> RETRACTING_AUTO -> IDLE
+        # RETURNING_HOME is a separate path, reachable from IDLE via the
+        # HOME button below, independent of the sequence above.
         self.auto_state = "IDLE"
         self._auto_confs = []
         self._auto_pause_ticks = 0
         self._reposition_start_mm = None
-        self._flash_target = None
-        self._flash_job = None
-        self._flash_on = False
+        self._wait_started_t = None       # PRE_/POST_DEPLOY_WAIT timers
+        self._act_label = ""              # "deploying" / "retracting", for the status line
+        self._act_last_val = None         # last seen telemetry "actuator" value
+        self._act_last_change_t = None
+        self._act_started_t = None
         self.start_btn = tk.Button(rob, text="▶ START", width=10,
                                    command=self._toggle_auto)
         self.start_btn.grid(row=0, column=5, padx=3, pady=3)
+        self.home_btn = tk.Button(rob, text="⌂ RETURN HOME", width=13,
+                                  command=self._on_return_home)
+        self.home_btn.grid(row=0, column=6, padx=3, pady=3)
         self.lbl_auto = tk.Label(rob, text="AUTO: idle", bg="#1e1e1e",
                                  fg="#ccc", font=("Menlo", 11), anchor="w")
-        self.lbl_auto.grid(row=4, column=0, columnspan=6,
+        self.lbl_auto.grid(row=4, column=0, columnspan=7,
                            sticky="w", padx=6, pady=(0, 4))
 
         # Servo + LED + zero: single click, latching.
@@ -786,18 +810,23 @@ class App:
 
     # ---- robot control plumbing ----
     def _hold_btn(self, parent, text, cmd, stop_cmd, r, c,
-                  on_press=None, on_release=None):
+                  on_press=None, on_release=None, guard_auto=False):
         """Press-and-hold button: sends `cmd` on press, `stop_cmd` on release.
 
         on_press/on_release, if given, run after the corresponding command
-        is sent -- used by DEPLOY (on_press: operator clicked it) and
-        RETRACT (on_release: operator finished retracting) to hook into the
-        autonomous state machine on top of their normal actuator behaviour.
+        is sent. guard_auto=True makes the press a no-op while the
+        autonomous sequence is running (auto_state != "IDLE") -- used for
+        DEPLOY/RETRACT so a manual click can't collide with the automatic
+        deploy/retract steps of that sequence. Release always still sends
+        stop_cmd regardless, since that's a safe no-op if press was ignored.
         """
         b = tk.Button(parent, text=text, width=10)
         b.grid(row=r, column=c, padx=3, pady=3)
 
         def _press(e):
+            if guard_auto and self.auto_state != "IDLE":
+                print(f"AUTO sequence running -- ignoring manual {text} click")
+                return
             self.link.send(cmd)
             if on_press:
                 on_press()
@@ -810,8 +839,6 @@ class App:
         b.bind("<ButtonRelease-1>", _release)
         # If the window loses focus mid-press we'd never see the release, so
         # stop on leave too — a motor left running is worse than a jerky UI.
-        # (Leave does NOT fire on_release: lifting off the button by accident
-        # isn't "finished retracting", it's an interrupted press.)
         b.bind("<Leave>", lambda e: self.link.send(stop_cmd))
         return b
 
@@ -848,8 +875,10 @@ class App:
                              fg="white" if self.drive_state == -1 else "black")
 
     # ---- autonomous scan loop ----
-    # States: IDLE -> SCANNING -> PAUSED -> REPOSITIONING -> DEPLOY_READY
-    #      -> RETRACT_READY -> RETURNING -> IDLE
+    # States: IDLE -> SCANNING -> PAUSED -> REPOSITIONING -> PRE_DEPLOY_WAIT
+    #      -> DEPLOYING -> POST_DEPLOY_WAIT -> RETRACTING_AUTO -> IDLE
+    # RETURNING_HOME is a separate path, reachable only from IDLE via the
+    # RETURN HOME button, independent of the sequence above.
     # See _auto_step() for the per-tick logic; this block is just the
     # entry/exit points reachable from buttons.
 
@@ -867,8 +896,8 @@ class App:
 
     def _cancel_auto(self):
         self.auto_state = "IDLE"
-        self._stop_flash()
-        self.link.send("S")
+        self.link.send("S")   # stop drive
+        self.link.send("X")   # stop actuator, in case this cancelled mid deploy/retract
         self.drive_state = 0
         self._update_drive_buttons()
         self.start_btn.config(text="▶ START", bg="#d9d9d9", fg="black")
@@ -883,6 +912,32 @@ class App:
             if "steps" in t:
                 return float(t["steps"]) / STEPS_PER_MM_FALLBACK
         return None
+
+    def _actuator_settled(self, now):
+        """True once telemetry's "actuator" field has stopped changing for
+        ACTUATOR_STABLE_SECS (or a safety timeout / no-telemetry fallback
+        has elapsed) -- used to detect "fully deployed" and "fully
+        retracted" without needing to know what the numbers actually mean.
+        Also updates the status label. Caller must have set
+        self._act_label/_act_last_val/_act_last_change_t/_act_started_t
+        when entering the watching state."""
+        with self.link.lock:
+            val = self.link.telem.get("actuator")
+        if val is None:
+            elapsed = now - self._act_started_t
+            self.lbl_auto.config(
+                text=f"AUTO: {self._act_label} (no actuator telemetry, {elapsed:.1f}s)",
+                fg="#e8a33d")
+            return elapsed >= ACTUATOR_NO_TELEM_WAIT_SECS
+        if self._act_last_val is None or val != self._act_last_val:
+            self._act_last_val = val
+            self._act_last_change_t = now
+        stable_for = now - self._act_last_change_t
+        self.lbl_auto.config(
+            text=f"AUTO: {self._act_label} (actuator={val}, stable {stable_for:.1f}s)",
+            fg="#8cf")
+        timed_out = (now - self._act_started_t) >= ACTUATOR_TIMEOUT_SECS
+        return stable_for >= ACTUATOR_STABLE_SECS or timed_out
 
     def _auto_step(self, detections, now):
         """Runs once per _tick(). `detections` is this frame's combined
@@ -921,9 +976,6 @@ class App:
             if len(self._auto_confs) >= AUTO_PAUSE_CONFIRM_TICKS:
                 if avg >= AUTO_DEPLOY_CONF:
                     self.auto_state = "REPOSITIONING"
-                    # This is the position to RETURN TO once retract is
-                    # done -- "original position" means right here, before
-                    # the forward repositioning move below.
                     self._reposition_start_mm = self._current_pos_mm()
                     self.link.send("F")
                     self.drive_state = 1
@@ -940,15 +992,15 @@ class App:
             pos = self._current_pos_mm()
             if self._reposition_start_mm is None or pos is None:
                 # No usable telemetry -- can't measure the reposition
-                # distance, so bail safely to a stop rather than drive
-                # forward blind indefinitely.
+                # distance, so bail safely to a stop and proceed anyway
+                # rather than drive forward blind indefinitely.
                 self.link.send("S")
                 self.drive_state = 0
                 self._update_drive_buttons()
-                self.auto_state = "DEPLOY_READY"
-                self._start_flash(self.deploy_btn)
+                self.auto_state = "PRE_DEPLOY_WAIT"
+                self._wait_started_t = now
                 self.lbl_auto.config(
-                    text="AUTO: no telemetry -- stopped early, check DEPLOY", fg="#f55")
+                    text="AUTO: no telemetry -- stopped early, waiting to deploy", fg="#f55")
                 return
             traveled = abs(pos - self._reposition_start_mm)
             self.lbl_auto.config(
@@ -958,90 +1010,103 @@ class App:
                 self.link.send("S")
                 self.drive_state = 0
                 self._update_drive_buttons()
-                self.auto_state = "DEPLOY_READY"
-                self._start_flash(self.deploy_btn)
+                self.auto_state = "PRE_DEPLOY_WAIT"
+                self._wait_started_t = now
             return
 
-        if self.auto_state == "DEPLOY_READY":
-            self.lbl_auto.config(text="AUTO: crack confirmed -- click DEPLOY", fg="#f55")
-            return
-
-        if self.auto_state == "RETRACT_READY":
-            self.lbl_auto.config(text="AUTO: deployed -- hold RETRACT, then release", fg="#f55")
-            return
-
-        if self.auto_state == "RETURNING":
-            pos = self._current_pos_mm()
-            target = self._reposition_start_mm
-            if pos is None or target is None:
-                # No usable telemetry -- can't measure the way back, so
-                # stop rather than drive blind indefinitely.
-                self.link.send("S")
-                self.drive_state = 0
-                self._update_drive_buttons()
-                self.auto_state = "IDLE"
-                self.start_btn.config(text="▶ START", bg="#d9d9d9", fg="black")
-                self.lbl_auto.config(
-                    text="AUTO: no telemetry -- stopped early, back at panel", fg="#f55")
-                return
-            remaining = pos - target   # positive: still ahead of target, drive back more
+        if self.auto_state == "PRE_DEPLOY_WAIT":
+            elapsed = now - self._wait_started_t
+            remaining = max(0.0, PRE_DEPLOY_WAIT_SECS - elapsed)
             self.lbl_auto.config(
-                text=f"AUTO: returning to original position ({max(remaining, 0):.0f} mm left)",
-                fg="#8cf")
-            if remaining <= RETURN_TOLERANCE_MM:
+                text=f"AUTO: crack confirmed -- deploying in {remaining:.1f}s", fg="#e8a33d")
+            if elapsed >= PRE_DEPLOY_WAIT_SECS:
+                self.auto_state = "DEPLOYING"
+                self.link.send("D")
+                self._act_label = "deploying"
+                self._act_last_val = None
+                self._act_last_change_t = now
+                self._act_started_t = now
+            return
+
+        if self.auto_state == "DEPLOYING":
+            if self._actuator_settled(now):
+                self.auto_state = "POST_DEPLOY_WAIT"
+                self._wait_started_t = now
+            return
+
+        if self.auto_state == "POST_DEPLOY_WAIT":
+            elapsed = now - self._wait_started_t
+            remaining = max(0.0, POST_DEPLOY_WAIT_SECS - elapsed)
+            self.lbl_auto.config(
+                text=f"AUTO: deployed -- retracting in {remaining:.1f}s", fg="#e8a33d")
+            if elapsed >= POST_DEPLOY_WAIT_SECS:
+                self.auto_state = "RETRACTING_AUTO"
+                self.link.send("R")
+                self._act_label = "retracting"
+                self._act_last_val = None
+                self._act_last_change_t = now
+                self._act_started_t = now
+            return
+
+        if self.auto_state == "RETRACTING_AUTO":
+            if self._actuator_settled(now):
+                self.link.send("X")   # explicit stop, safe even if already done
+                self.auto_state = "IDLE"
+                self.start_btn.config(text="▶ START", bg="#d9d9d9", fg="black")
+                self.lbl_auto.config(
+                    text="AUTO: sequence complete -- manual control (or RETURN HOME)",
+                    fg="#ccc")
+            return
+
+        if self.auto_state == "RETURNING_HOME":
+            # Deliberately ignores `detections` entirely -- once homing has
+            # started, it must not stop for a crack. Only telemetry loss or
+            # an explicit cancel (STOP ALL / clicking the button again) can
+            # interrupt it before it reaches home.
+            pos = self._current_pos_mm()
+            if pos is None:
                 self.link.send("S")
                 self.drive_state = 0
                 self._update_drive_buttons()
                 self.auto_state = "IDLE"
                 self.start_btn.config(text="▶ START", bg="#d9d9d9", fg="black")
                 self.lbl_auto.config(
-                    text="AUTO: back at original position -- click START to resume", fg="#ccc")
+                    text="AUTO: no telemetry -- can't return home, stopped", fg="#f55")
+                return
+            diff = pos - 0.0   # "home" = wherever ZERO ODOM was last pressed
+            if abs(diff) <= HOME_TOLERANCE_MM:
+                self.link.send("S")
+                self.drive_state = 0
+                self._update_drive_buttons()
+                self.auto_state = "IDLE"
+                self.start_btn.config(text="▶ START", bg="#d9d9d9", fg="black")
+                self.lbl_auto.config(
+                    text="AUTO: home -- click START to scan again", fg="#ccc")
+                return
+            # Direction-aware and re-checked every tick, so it self-corrects
+            # even if it overshoots or starts on either side of home.
+            desired = -1 if diff > 0 else 1
+            if self.drive_state != desired:
+                self.link.send("B" if desired == -1 else "F")
+                self.drive_state = desired
+                self._update_drive_buttons()
+            self.lbl_auto.config(
+                text=f"AUTO: returning home ({abs(diff):.0f} mm left)", fg="#8cf")
             return
 
-    def _start_flash(self, btn):
-        self._flash_target = btn
-        self._flash_on = False
-        self._flash_tick()
-
-    def _flash_tick(self):
-        if self.auto_state not in ("DEPLOY_READY", "RETRACT_READY") \
-                or self._flash_target is None:
+    def _on_return_home(self):
+        """RETURN HOME button -- only available when nothing else is
+        running (a crack sequence must finish or be cancelled first)."""
+        if self.auto_state != "IDLE":
+            print("AUTO sequence running -- finish or STOP ALL before returning home")
             return
-        self._flash_on = not self._flash_on
-        self._flash_target.config(bg="#ff3b30" if self._flash_on else "#d9d9d9",
-                                  fg="white" if self._flash_on else "black")
-        self._flash_job = self.root.after(400, self._flash_tick)
+        if self._current_pos_mm() is None:
+            print("No telemetry -- can't return home without position feedback")
+            return
+        self.auto_state = "RETURNING_HOME"
+        self.start_btn.config(text="■ STOP", bg="#2d6b2d", fg="white")
+        self.lbl_auto.config(text="AUTO: returning home...", fg="#8cf")
 
-    def _stop_flash(self):
-        if self._flash_job:
-            self.root.after_cancel(self._flash_job)
-            self._flash_job = None
-        if self._flash_target is not None:
-            self._flash_target.config(bg="#d9d9d9", fg="black")
-            self._flash_target = None
-
-    def _on_deploy_pressed(self):
-        """Fires when the operator clicks DEPLOY (on top of the normal
-        actuator press/release behaviour already sending 'D'/'X'). Hands
-        off to a flashing RETRACT -- the robot stays put until the
-        operator retracts, then drives itself back."""
-        if self.auto_state == "DEPLOY_READY":
-            self._stop_flash()
-            self.auto_state = "RETRACT_READY"
-            self._start_flash(self.retract_btn)
-            self.lbl_auto.config(text="AUTO: deployed -- hold RETRACT, then release", fg="#f55")
-
-    def _on_retract_released(self):
-        """Fires when the operator RELEASES RETRACT (on top of the normal
-        actuator press/release behaviour already sending 'R'/'X') -- taken
-        as "the retract command has been fully done". Starts driving the
-        robot back to its position before the forward reposition move."""
-        if self.auto_state == "RETRACT_READY":
-            self._stop_flash()
-            self.auto_state = "RETURNING"
-            self.link.send("B")
-            self.drive_state = -1
-            self._update_drive_buttons()
 
     # ---- keyboard drive: F/B keys, works ALONGSIDE the click-toggle
     # buttons above (both just flip the same drive_state) ----
