@@ -45,7 +45,7 @@ IMU imu;
 LED led;
 
 //STEPPER VARIABLES
-int STEP_HZ = 100;
+int STEP_HZ = 80;
 
 // Calibrated in the pipe with the robot fully assembled, 7 runs from
 // 32cm-73cm each. Weighted average (total steps / total distance):
