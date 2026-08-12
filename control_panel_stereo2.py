@@ -5,11 +5,16 @@ Capture and calibration only. No motor / servo / actuator controls —
 robot driving lives in the teammate's panel.
 
 What this does:
-  * Live left/right video from the two ESP32-CAMs
+  * Live left/right video from the two ESP32-CAMs, each running its own
+    crack/hole detector (redundancy, not stereo depth -- see note below)
   * REC          -> record both feeds to MP4 (footage review)
   * SAVE / AUTO-CAP -> synchronized PNG stills (YOLO training set)
-  * CALIB PAIR   -> checkerboard pairs for stereo calibration
-  * click the LEFT view -> distance to that point (needs stereo_calib.npz)
+  * CALIB PAIR   -> checkerboard pairs, kept for a future stereo rebuild
+
+Distance is reported ONLY from the stepper's own odometry (telemetry's
+pos_mm / steps) via DISTANCE TRAVELED. Stereo camera-distance and IMU
+telemetry (imu_pos/imu_vel/imu_bias/slip) were removed from this panel --
+they were not accurate enough to rely on.
 
 Works with either S3 firmware (cameras-only sketch or the full PlatformIO
 build) — both send the same frame protocol:
@@ -47,7 +52,6 @@ PORT   = None          # None = auto-detect (cross-platform, by VID), or force e
 BAUD   = 921600        # ignored by USB CDC but pyserial requires it
 SCALE  = 2             # display zoom (320x240 -> 640x480)
 
-CALIB_FILE  = os.path.join(HERE, "stereo_calib.npz")
 # All captured data lives under one folder in the course directory so it
 # is easy to find, back up, and hand in.
 DATA_DIR    = os.path.expanduser("~/Desktop/30.007/pipe_cam_data")
@@ -71,6 +75,34 @@ MAX_COLOUR_JUMP = 45.0
 # Crack/hole detection model. Set to your trained weights path.
 CV_MODEL_PATH = os.path.join(HERE, "CV.pt")
 CV_CONF = 0.2
+
+# ---- autonomous scan loop ----
+# This is a SEPARATE, higher bar than CV_CONF above. CV_CONF (and the "conf"
+# slider) controls what the tracker bothers to report at all. This constant
+# controls the much bigger decision of "stop and reposition for a human to
+# look at this" -- a false positive here wastes travel distance and an
+# operator's attention, so it's set high on purpose.
+AUTO_DEPLOY_CONF = 0.8
+# Lower bar: a detection needs at least this much confidence to make the
+# robot stop and take a closer look at all. Below this, it's ignored and
+# scanning continues -- only detections at or above this get a second look.
+AUTO_PAUSE_TRIGGER_CONF = 0.5
+# How far to drive FORWARD, past a confirmed crack, before flagging DEPLOY, in mm.
+AUTO_REPOSITION_MM = 20.0
+# How close is "close enough" when driving back to the original position
+# after retracting -- odometry won't land on the target exactly, in mm.
+RETURN_TOLERANCE_MM = 2.0
+# After stopping to look at a detection, wait this many ticks (40ms each)
+# before trusting any confidence reading -- the frame is still motion-blurred
+# from driving for the first few ticks after 'S' is sent.
+AUTO_PAUSE_SETTLE_TICKS = 5
+# Then average confidence over this many ticks before deciding. Averaging
+# beats trusting a single frame, since a single frame can spike or drop from
+# lighting flicker or a partial view of the crack.
+AUTO_PAUSE_CONFIRM_TICKS = 8
+# Fallback conversion if telemetry ever has 'steps' but no 'pos_mm' -- from
+# the calibration run: 2352 steps measured over 730mm of travel.
+STEPS_PER_MM_FALLBACK = 2352 / 730.0
 
 # Rotation applied to each camera on arrival: 0, 90, 180 or 270 clockwise.
 # PER CAMERA, because the two are not necessarily mounted the same way —
@@ -418,59 +450,18 @@ class FrameLink:
         self.running = False
 
 
-# ============================ CALIBRATION ============================
-class StereoCalib:
-    def __init__(self, path):
-        self.ok = False
-        self.error = None
-        if not os.path.exists(path):
-            self.error = "no stereo_calib.npz — run stereo_calibrate.py"
-            return
-        try:
-            d = np.load(path)
-            self.map1x, self.map1y = d["map1x"], d["map1y"]
-            self.map2x, self.map2y = d["map2x"], d["map2y"]
-            self.fx = float(d["fx"])
-            self.baseline = float(d["baseline"])       # mm
-            self.sgbm = cv2.StereoSGBM_create(
-                minDisparity=0, numDisparities=256, blockSize=7,
-                P1=8 * 49, P2=32 * 49, uniquenessRatio=10,
-                speckleWindowSize=100, speckleRange=2, disp12MaxDiff=1)
-            self.ok = True
-        except KeyError:
-            self.error = ("stereo_calib.npz is an old format — "
-                          "re-run stereo_calibrate.py")
+class CamWorker(threading.Thread):
+    """Hands off the latest L/R frame pair to the GUI thread at a steady
+    rate. No stereo rectification or disparity here anymore -- that
+    distance-from-cameras readout was never reliable enough to trust, so
+    it's gone. The only distance this panel reports now is the stepper's
+    own odometry (DISTANCE TRAVELED, from telemetry)."""
 
-    def rectify(self, left, right):
-        if not self.ok:
-            return left, right
-        return (cv2.remap(left, self.map1x, self.map1y, cv2.INTER_LINEAR),
-                cv2.remap(right, self.map2x, self.map2y, cv2.INTER_LINEAR))
-
-    def disparity(self, rect_l, rect_r):
-        gl = cv2.cvtColor(rect_l, cv2.COLOR_BGR2GRAY)
-        gr = cv2.cvtColor(rect_r, cv2.COLOR_BGR2GRAY)
-        return self.sgbm.compute(gl, gr).astype(np.float32) / 16.0
-
-    def distance_mm(self, disp, x, y):
-        h, w = disp.shape
-        x0, x1 = max(0, x - 4), min(w, x + 5)
-        y0, y1 = max(0, y - 4), min(h, y + 5)
-        patch = disp[y0:y1, x0:x1]
-        good = patch[patch > 0.5]
-        if good.size < 10:
-            return None
-        return self.fx * self.baseline / float(np.median(good))
-
-
-class DepthWorker(threading.Thread):
-    """Rectify + disparity at ~5 Hz (SGBM is the expensive part)."""
-
-    def __init__(self, link, calib):
+    def __init__(self, link):
         super().__init__(daemon=True)
-        self.link, self.calib = link, calib
+        self.link = link
         self.lock = threading.Lock()
-        self.view_l = self.view_r = self.disp = None
+        self.view_l = self.view_r = None
         self.running = True
 
     def run(self):
@@ -479,29 +470,20 @@ class DepthWorker(threading.Thread):
             if l is None and r is None:
                 time.sleep(0.05)
                 continue
-            # Depth needs BOTH cameras. With only one connected, still show
-            # its video — recording and dataset capture work fine mono.
-            if self.calib.ok and l is not None and r is not None:
-                rl, rr = self.calib.rectify(l, r)
-                d = self.calib.disparity(rl, rr)
-                with self.lock:
-                    self.view_l, self.view_r, self.disp = rl, rr, d
-                time.sleep(0.15)
-            else:
-                with self.lock:
-                    self.view_l, self.view_r, self.disp = l, r, None
-                time.sleep(0.03)
+            with self.lock:
+                self.view_l, self.view_r = l, r
+            time.sleep(0.03)
 
     def snapshot(self):
         with self.lock:
-            return self.view_l, self.view_r, self.disp
+            return self.view_l, self.view_r
 
 
 # ============================ GUI ============================
 class App:
-    def __init__(self, root, link, calib):
-        self.root, self.link, self.calib = root, link, calib
-        self.worker = DepthWorker(link, calib)
+    def __init__(self, root, link):
+        self.root, self.link = root, link
+        self.worker = CamWorker(link)
         self.worker.start()
 
         # Crack/hole detector — runs on the LEFT view each tick. Loaded
@@ -570,16 +552,10 @@ class App:
                              fg="#888", width=44, height=16)
         self.lblL.grid(row=0, column=0, padx=4)
         self.lblR.grid(row=0, column=1, padx=4)
-        self.lblL.bind("<Button-1>", self.on_click_left)
 
-        self.lbl_dist = tk.Label(body, text="distance: --", bg="#1e1e1e",
-                                 fg="#ff0", font=("Menlo", 15, "bold"))
-        self.lbl_dist.pack()
-
-        # How far the ROBOT has traveled (from telemetry's pos_mm, i.e.
-        # steps / STEPS_PER_MM on the firmware) -- deliberately separate
-        # from lbl_dist above, which is the crack-to-camera distance.
-        # Made large/bold/cyan specifically so it's easy to spot at a
+        # How far the ROBOT has traveled, from telemetry's pos_mm (i.e.
+        # steps / STEPS_PER_MM on the firmware) -- the ONLY distance this
+        # panel reports. Made large/bold/cyan so it's easy to spot at a
         # glance while driving, unlike the small diagnostics text below.
         self.lbl_traveled = tk.Label(body, text="DISTANCE TRAVELED: -- cm",
                                      bg="#1e1e1e", fg="#0ff",
@@ -638,9 +614,35 @@ class App:
                   highlightbackground="#8b0000",
                   command=self.stop_all).grid(row=0, column=2, padx=3, pady=3)
 
-        # Actuator: also hold-to-move, release stops.
-        self._hold_btn(rob, "DEPLOY", "D", "X", 0, 3)
-        self._hold_btn(rob, "RETRACT", "R", "X", 0, 4)
+        # Actuator: also hold-to-move, release stops. DEPLOY gets an
+        # on_press hook (operator clicked it) and RETRACT gets an on_release
+        # hook (operator finished retracting) -- both stored so the
+        # autonomous loop below can flash each one in turn and know when
+        # the operator has acted on it.
+        self.deploy_btn = self._hold_btn(rob, "DEPLOY", "D", "X", 0, 3,
+                                         on_press=self._on_deploy_pressed)
+        self.retract_btn = self._hold_btn(rob, "RETRACT", "R", "X", 0, 4,
+                                          on_release=self._on_retract_released)
+
+        # ---- autonomous scan ----
+        # One button instead of manually toggling FWD/BACK: click START and
+        # the robot drives itself, stopping on its own to examine cracks.
+        # IDLE -> SCANNING -> PAUSED -> REPOSITIONING -> DEPLOY_READY
+        #      -> RETRACT_READY -> RETURNING -> IDLE
+        self.auto_state = "IDLE"
+        self._auto_confs = []
+        self._auto_pause_ticks = 0
+        self._reposition_start_mm = None
+        self._flash_target = None
+        self._flash_job = None
+        self._flash_on = False
+        self.start_btn = tk.Button(rob, text="▶ START", width=10,
+                                   command=self._toggle_auto)
+        self.start_btn.grid(row=0, column=5, padx=3, pady=3)
+        self.lbl_auto = tk.Label(rob, text="AUTO: idle", bg="#1e1e1e",
+                                 fg="#ccc", font=("Menlo", 11), anchor="w")
+        self.lbl_auto.grid(row=4, column=0, columnspan=6,
+                           sticky="w", padx=6, pady=(0, 4))
 
         # Servo + LED + zero: single click, latching.
         for col, (label, ch) in enumerate([
@@ -698,7 +700,6 @@ class App:
                   command=self.save_calib_pair).grid(row=0, column=3, padx=4)
 
         # ---- state ----
-        self.target = None
         self.recording = False
         self.writers = [None, None]
         self.rec_paths = None
@@ -714,10 +715,6 @@ class App:
         self._release_jobs = {}   # per-key debounce timers, see _key_up()
         self._bind_drive_keys(root)
         self._tick()
-
-    # ---- distance ----
-    def on_click_left(self, event):
-        self.target = (event.x // SCALE, event.y // SCALE)
 
     # ---- recording ----
     def toggle_record(self):
@@ -788,17 +785,40 @@ class App:
         self.btn_auto.config(text=f"AUTO-CAP: {'ON' if self.autocap else 'OFF'}")
 
     # ---- robot control plumbing ----
-    def _hold_btn(self, parent, text, cmd, stop_cmd, r, c):
-        """Press-and-hold button: sends `cmd` on press, `stop_cmd` on release."""
+    def _hold_btn(self, parent, text, cmd, stop_cmd, r, c,
+                  on_press=None, on_release=None):
+        """Press-and-hold button: sends `cmd` on press, `stop_cmd` on release.
+
+        on_press/on_release, if given, run after the corresponding command
+        is sent -- used by DEPLOY (on_press: operator clicked it) and
+        RETRACT (on_release: operator finished retracting) to hook into the
+        autonomous state machine on top of their normal actuator behaviour.
+        """
         b = tk.Button(parent, text=text, width=10)
         b.grid(row=r, column=c, padx=3, pady=3)
-        b.bind("<ButtonPress-1>", lambda e: self.link.send(cmd))
-        b.bind("<ButtonRelease-1>", lambda e: self.link.send(stop_cmd))
+
+        def _press(e):
+            self.link.send(cmd)
+            if on_press:
+                on_press()
+
+        def _release(e):
+            self.link.send(stop_cmd)
+            if on_release:
+                on_release()
+        b.bind("<ButtonPress-1>", _press)
+        b.bind("<ButtonRelease-1>", _release)
         # If the window loses focus mid-press we'd never see the release, so
         # stop on leave too — a motor left running is worse than a jerky UI.
+        # (Leave does NOT fire on_release: lifting off the button by accident
+        # isn't "finished retracting", it's an interrupted press.)
         b.bind("<Leave>", lambda e: self.link.send(stop_cmd))
+        return b
 
     def _toggle_forward(self):
+        if self.auto_state != "IDLE":
+            print("AUTO mode is running -- click START to stop it before driving manually")
+            return
         if self.drive_state == 1:
             self.link.send("S")
             self.drive_state = 0
@@ -808,6 +828,9 @@ class App:
         self._update_drive_buttons()
 
     def _toggle_backward(self):
+        if self.auto_state != "IDLE":
+            print("AUTO mode is running -- click START to stop it before driving manually")
+            return
         if self.drive_state == -1:
             self.link.send("S")
             self.drive_state = 0
@@ -823,6 +846,202 @@ class App:
                             fg="white" if self.drive_state == 1 else "black")
         self.back_btn.config(bg="#2d6b2d" if self.drive_state == -1 else "#d9d9d9",
                              fg="white" if self.drive_state == -1 else "black")
+
+    # ---- autonomous scan loop ----
+    # States: IDLE -> SCANNING -> PAUSED -> REPOSITIONING -> DEPLOY_READY
+    #      -> RETRACT_READY -> RETURNING -> IDLE
+    # See _auto_step() for the per-tick logic; this block is just the
+    # entry/exit points reachable from buttons.
+
+    def _toggle_auto(self):
+        if self.auto_state == "IDLE":
+            self.auto_state = "SCANNING"
+            self._auto_confs = []
+            self._auto_pause_ticks = 0
+            self.link.send("F")
+            self.drive_state = 1
+            self._update_drive_buttons()
+            self.start_btn.config(text="■ STOP SCAN", bg="#2d6b2d", fg="white")
+        else:
+            self._cancel_auto()
+
+    def _cancel_auto(self):
+        self.auto_state = "IDLE"
+        self._stop_flash()
+        self.link.send("S")
+        self.drive_state = 0
+        self._update_drive_buttons()
+        self.start_btn.config(text="▶ START", bg="#d9d9d9", fg="black")
+        self.lbl_auto.config(text="AUTO: idle", fg="#ccc")
+
+    def _current_pos_mm(self):
+        """Best-effort read of how far the robot has driven, per telemetry."""
+        with self.link.lock:
+            t = self.link.telem
+            if "pos_mm" in t:
+                return float(t["pos_mm"])
+            if "steps" in t:
+                return float(t["steps"]) / STEPS_PER_MM_FALLBACK
+        return None
+
+    def _auto_step(self, detections, now):
+        """Runs once per _tick(). `detections` is this frame's combined
+        L+R confirmed-crack list. Advances the state machine below."""
+        if self.auto_state == "IDLE":
+            return
+
+        if self.auto_state == "SCANNING":
+            if self.drive_state != 1:
+                self.link.send("F")
+                self.drive_state = 1
+                self._update_drive_buttons()
+            if any(d.conf >= AUTO_PAUSE_TRIGGER_CONF for d in detections):
+                # Stop immediately for a clearer, non-motion-blurred look
+                # before trusting any confidence number.
+                self.link.send("S")
+                self.drive_state = 0
+                self._update_drive_buttons()
+                self.auto_state = "PAUSED"
+                self._auto_pause_ticks = 0
+                self._auto_confs = []
+            self.lbl_auto.config(text="AUTO: scanning...", fg="#0f0")
+            return
+
+        if self.auto_state == "PAUSED":
+            self._auto_pause_ticks += 1
+            if self._auto_pause_ticks <= AUTO_PAUSE_SETTLE_TICKS:
+                self.lbl_auto.config(text="AUTO: stopped, settling...", fg="#e8a33d")
+                return
+            self._auto_confs.append(max((d.conf for d in detections), default=0.0))
+            avg = sum(self._auto_confs) / len(self._auto_confs)
+            self.lbl_auto.config(
+                text=f"AUTO: checking crack — conf {avg:.2f} "
+                     f"({len(self._auto_confs)}/{AUTO_PAUSE_CONFIRM_TICKS})",
+                fg="#e8a33d")
+            if len(self._auto_confs) >= AUTO_PAUSE_CONFIRM_TICKS:
+                if avg >= AUTO_DEPLOY_CONF:
+                    self.auto_state = "REPOSITIONING"
+                    # This is the position to RETURN TO once retract is
+                    # done -- "original position" means right here, before
+                    # the forward repositioning move below.
+                    self._reposition_start_mm = self._current_pos_mm()
+                    self.link.send("F")
+                    self.drive_state = 1
+                    self._update_drive_buttons()
+                else:
+                    # False alarm (shadow/seam) -- resume scanning forward.
+                    self.auto_state = "SCANNING"
+                    self.link.send("F")
+                    self.drive_state = 1
+                    self._update_drive_buttons()
+            return
+
+        if self.auto_state == "REPOSITIONING":
+            pos = self._current_pos_mm()
+            if self._reposition_start_mm is None or pos is None:
+                # No usable telemetry -- can't measure the reposition
+                # distance, so bail safely to a stop rather than drive
+                # forward blind indefinitely.
+                self.link.send("S")
+                self.drive_state = 0
+                self._update_drive_buttons()
+                self.auto_state = "DEPLOY_READY"
+                self._start_flash(self.deploy_btn)
+                self.lbl_auto.config(
+                    text="AUTO: no telemetry -- stopped early, check DEPLOY", fg="#f55")
+                return
+            traveled = abs(pos - self._reposition_start_mm)
+            self.lbl_auto.config(
+                text=f"AUTO: repositioning {traveled:.0f}/{AUTO_REPOSITION_MM:.0f} mm",
+                fg="#8cf")
+            if traveled >= AUTO_REPOSITION_MM:
+                self.link.send("S")
+                self.drive_state = 0
+                self._update_drive_buttons()
+                self.auto_state = "DEPLOY_READY"
+                self._start_flash(self.deploy_btn)
+            return
+
+        if self.auto_state == "DEPLOY_READY":
+            self.lbl_auto.config(text="AUTO: crack confirmed -- click DEPLOY", fg="#f55")
+            return
+
+        if self.auto_state == "RETRACT_READY":
+            self.lbl_auto.config(text="AUTO: deployed -- hold RETRACT, then release", fg="#f55")
+            return
+
+        if self.auto_state == "RETURNING":
+            pos = self._current_pos_mm()
+            target = self._reposition_start_mm
+            if pos is None or target is None:
+                # No usable telemetry -- can't measure the way back, so
+                # stop rather than drive blind indefinitely.
+                self.link.send("S")
+                self.drive_state = 0
+                self._update_drive_buttons()
+                self.auto_state = "IDLE"
+                self.start_btn.config(text="▶ START", bg="#d9d9d9", fg="black")
+                self.lbl_auto.config(
+                    text="AUTO: no telemetry -- stopped early, back at panel", fg="#f55")
+                return
+            remaining = pos - target   # positive: still ahead of target, drive back more
+            self.lbl_auto.config(
+                text=f"AUTO: returning to original position ({max(remaining, 0):.0f} mm left)",
+                fg="#8cf")
+            if remaining <= RETURN_TOLERANCE_MM:
+                self.link.send("S")
+                self.drive_state = 0
+                self._update_drive_buttons()
+                self.auto_state = "IDLE"
+                self.start_btn.config(text="▶ START", bg="#d9d9d9", fg="black")
+                self.lbl_auto.config(
+                    text="AUTO: back at original position -- click START to resume", fg="#ccc")
+            return
+
+    def _start_flash(self, btn):
+        self._flash_target = btn
+        self._flash_on = False
+        self._flash_tick()
+
+    def _flash_tick(self):
+        if self.auto_state not in ("DEPLOY_READY", "RETRACT_READY") \
+                or self._flash_target is None:
+            return
+        self._flash_on = not self._flash_on
+        self._flash_target.config(bg="#ff3b30" if self._flash_on else "#d9d9d9",
+                                  fg="white" if self._flash_on else "black")
+        self._flash_job = self.root.after(400, self._flash_tick)
+
+    def _stop_flash(self):
+        if self._flash_job:
+            self.root.after_cancel(self._flash_job)
+            self._flash_job = None
+        if self._flash_target is not None:
+            self._flash_target.config(bg="#d9d9d9", fg="black")
+            self._flash_target = None
+
+    def _on_deploy_pressed(self):
+        """Fires when the operator clicks DEPLOY (on top of the normal
+        actuator press/release behaviour already sending 'D'/'X'). Hands
+        off to a flashing RETRACT -- the robot stays put until the
+        operator retracts, then drives itself back."""
+        if self.auto_state == "DEPLOY_READY":
+            self._stop_flash()
+            self.auto_state = "RETRACT_READY"
+            self._start_flash(self.retract_btn)
+            self.lbl_auto.config(text="AUTO: deployed -- hold RETRACT, then release", fg="#f55")
+
+    def _on_retract_released(self):
+        """Fires when the operator RELEASES RETRACT (on top of the normal
+        actuator press/release behaviour already sending 'R'/'X') -- taken
+        as "the retract command has been fully done". Starts driving the
+        robot back to its position before the forward reposition move."""
+        if self.auto_state == "RETRACT_READY":
+            self._stop_flash()
+            self.auto_state = "RETURNING"
+            self.link.send("B")
+            self.drive_state = -1
+            self._update_drive_buttons()
 
     # ---- keyboard drive: F/B keys, works ALONGSIDE the click-toggle
     # buttons above (both just flip the same drive_state) ----
@@ -849,6 +1068,8 @@ class App:
         root.focus_set()   # window must have keyboard focus to see these at all
 
     def _key_down(self, key):
+        if self.auto_state != "IDLE":
+            return   # AUTO mode owns the drive commands right now
         pending = self._release_jobs.pop(key, None)
         if pending is not None:
             self.root.after_cancel(pending)
@@ -891,11 +1112,13 @@ class App:
             self.cv_tracker_r.conf_threshold = v
 
     def stop_all(self):
-        """Panic button: stop drive AND actuator."""
+        """Panic button: stop drive AND actuator, and cancel AUTO mode."""
         self.link.send("S")
         self.link.send("X")
         self.drive_state = 0
         self._update_drive_buttons()
+        if self.auto_state != "IDLE":
+            self._cancel_auto()
 
     # ---- live diagnostics ----
     def _diag_numbers(self):
@@ -995,28 +1218,20 @@ class App:
         t = self.link.telem
         if t:
             print("  telemetry   " + ", ".join(f"{k}={v}" for k, v in t.items()))
-        print(f"  calibration {'loaded' if self.calib.ok else self.calib.error}")
         print(f"\n  -> {verdict}")
         print("=" * 58 + "\n")
 
-    def _draw_detections(self, img, detections, disp, cv_lines, tag):
+    def _draw_detections(self, img, detections, cv_lines, tag):
         """Draws confirmed detections onto img in place, and appends their
         text summary (with tag "L"/"R" so the panel shows which camera each
-        came from) into cv_lines."""
+        came from) into cv_lines. No distance here -- camera-distance was
+        removed as unreliable; DISTANCE TRAVELED (stepper odometry) is the
+        only distance this panel reports."""
         for det in detections:
             pts = det.mask_xy
             cv2.polylines(img, [pts], isClosed=True, color=(0, 0, 255),
                          thickness=2)
-            cx, cy = int(det.centroid[0]), int(det.centroid[1])
-            dist_txt = "--"
-            if disp is not None:
-                dm = self.calib.distance_mm(disp, cx, cy)
-                if dm:
-                    dist_txt = f"{dm / 10:.1f}cm"
-            # On-screen label: just the class name + distance to THIS crack,
-            # no ID/confidence clutter. ID and confidence still go into
-            # cv_lines below for the text panel, in case they're useful there.
-            label_txt = f"{det.label} {dist_txt}"
+            label_txt = f"{det.label} {det.conf:.2f}"
             (tw_, th_), _ = cv2.getTextSize(label_txt,
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             x1, y1 = pts[:, 0].min(), pts[:, 1].min()
@@ -1026,11 +1241,11 @@ class App:
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1,
                        cv2.LINE_AA)
             cv_lines.append(f"{tag} ID{det.track_id}  {det.label:<6}"
-                           f"  conf {det.conf:.2f}  dist {dist_txt}")
+                           f"  conf {det.conf:.2f}")
 
     # ---- main loop ----
     def _tick(self):
-        img_l, img_r, disp = self.worker.snapshot()
+        img_l, img_r = self.worker.snapshot()
 
         det_l, det_r = [], []
         if img_l is not None and self.cv_tracker_l is not None:
@@ -1047,22 +1262,13 @@ class App:
         cv_lines = []
 
         if img_l is not None:
-            h, w = img_l.shape[:2]
-            tx, ty = self.target if self.target else (w // 2, h // 2)
-            if disp is not None:
-                d = self.calib.distance_mm(disp, tx, ty)
-                self.lbl_dist.config(
-                    text=f"distance: {d / 10:.1f} cm" if d
-                         else "distance: -- (no texture / too close)",
-                    fg="#ff0" if d else "#e8a33d")
             vis_l = img_l.copy()
-            cv2.drawMarker(vis_l, (tx, ty), (0, 255, 255), cv2.MARKER_CROSS, 15, 1)
-            self._draw_detections(vis_l, det_l, disp, cv_lines, "L")
+            self._draw_detections(vis_l, det_l, cv_lines, "L")
             self._show(self.lblL, vis_l)
 
         if img_r is not None:
             vis_r = img_r.copy()
-            self._draw_detections(vis_r, det_r, disp, cv_lines, "R")
+            self._draw_detections(vis_r, det_r, cv_lines, "R")
             self._show(self.lblR, vis_r)
 
         if (self.cv_tracker_l is not None or self.cv_tracker_r is not None) \
@@ -1071,8 +1277,10 @@ class App:
                 text="\n".join(cv_lines) if cv_lines else "no confirmed detections",
                 fg="#f66")
 
-        # fps + health line
         now = time.time()
+        self._auto_step(det_l + det_r, now)
+
+        # fps + health line
         if now - self._fps_t0 >= 1.0:
             cl, cr = self.link.counts[0], self.link.counts[1]
             fl = (cl - self._fps_base[0]) / (now - self._fps_t0)
@@ -1082,17 +1290,17 @@ class App:
             msg = f"L {fl:.1f} fps   R {fr:.1f} fps   dropped {self.link.dropped}"
             if self.recording:
                 msg += "   ● RECORDING"
-            if not self.calib.ok:
-                msg += f"   |  {self.calib.error}"
-            self.lbl_status.config(
-                text=msg, fg="#0f0" if self.calib.ok else "#e8a33d")
+            self.lbl_status.config(text=msg, fg="#0f0")
             self._update_diagnostics(fl, fr, now)
 
             with self.link.lock:
                 t = dict(self.link.telem)
+            # IMU-derived fields aren't trusted, so they're dropped from
+            # display here even if the firmware still sends them.
+            t = {k: v for k, v in t.items()
+                if k not in ("imu_pos", "imu_vel", "imu_bias", "slip")}
             if t:
-                order = ["servo_angle", "steps", "stepper_drive_dir",
-                         "actuator", "imu_pos", "imu_vel", "imu_bias", "slip"]
+                order = ["servo_angle", "steps", "stepper_drive_dir", "actuator"]
                 keys = [k for k in order if k in t] + \
                        [k for k in t if k not in order]
                 self.lbl_telem.config(
@@ -1161,12 +1369,8 @@ def main():
     link.chan_log.write("t,cam,r,g,b\n")
     print("logging colour drift to", log_path)
 
-    calib = StereoCalib(CALIB_FILE)
-    if not calib.ok:
-        print(calib.error + " — distance readout disabled.")
-
     root = tk.Tk()
-    App(root, link, calib)
+    App(root, link)
     root.mainloop()
 
 
