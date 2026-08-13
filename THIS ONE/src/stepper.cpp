@@ -27,12 +27,35 @@ bool Stepper::begin(int stepPin, int dirPin, int enPin, int stepHz) {
 
   timerAttachInterrupt(timer_, &Stepper::isrTrampoline, true);
 
-  uint64_t intervalUs = 1000000UL / (stepHz * 2);
-  timerAlarmWrite(timer_, intervalUs, true);
+  setStepHz(stepHz);
   timerAlarmEnable(timer_);
 
   return true;
 
+}
+
+
+void Stepper::setStepHz(int hz) {
+  // The ISR toggles the STEP pin, so it must fire TWICE per step: once for the
+  // rising edge and once for the falling edge. Hence the * 2 — drop it and the
+  // motor runs at half the requested speed.
+  if (hz < 1)    hz = 1;        // 0 would divide by zero and kill the timer
+  if (hz > 5000) hz = 5000;     // far past anything this drivetrain can pull
+
+  stepHz_ = hz;
+  if (timer_ == nullptr) {
+    return;                     // begin() hasn't run yet; value is remembered
+  }
+  uint64_t intervalUs = 1000000UL / ((uint64_t)hz * 2);
+  // Rewriting the alarm on a running timer is fine: it takes effect from the
+  // next period. Direction and stepCount_ are not touched, so changing speed
+  // mid-move does not disturb the odometer.
+  timerAlarmWrite(timer_, intervalUs, true);
+}
+
+
+int Stepper::getStepHz() const {
+  return stepHz_;
 }
 
 

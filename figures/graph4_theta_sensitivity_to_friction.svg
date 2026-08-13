@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="440" viewBox="0 0 680 440" font-family="Helvetica, Arial, sans-serif">
+<rect x="348" y="60" width="123" height="320" fill="#639922" opacity="0.14"/>
+
+<line x1="90" y1="60" x2="90" y2="380" stroke="#666" stroke-width="1.6"/>
+<line x1="90" y1="380" x2="560" y2="380" stroke="#666" stroke-width="1.6"/>
+
+<text x="90" y="48" font-size="12" fill="#555">maximum obstacle angle &#952; max (degrees)</text>
+<text x="82" y="384" font-size="12" fill="#555" text-anchor="end">0</text>
+<text x="82" y="277" font-size="12" fill="#555" text-anchor="end">20</text>
+<text x="82" y="171" font-size="12" fill="#555" text-anchor="end">40</text>
+<text x="82" y="64" font-size="12" fill="#555" text-anchor="end">60</text>
+<text x="90" y="399" font-size="12" fill="#555" text-anchor="middle">0.2</text>
+<text x="184" y="399" font-size="12" fill="#555" text-anchor="middle">0.4</text>
+<text x="278" y="399" font-size="12" fill="#555" text-anchor="middle">0.6</text>
+<text x="372" y="399" font-size="12" fill="#555" text-anchor="middle">0.8</text>
+<text x="466" y="399" font-size="12" fill="#555" text-anchor="middle">1.0</text>
+<text x="560" y="399" font-size="12" fill="#555" text-anchor="middle">1.2</text>
+<text x="325" y="420" font-size="13" fill="#333" text-anchor="middle">friction coefficient &#956;</text>
+
+<polyline points="90,323 137,295 184,269 231,245 278,222 325,201 372,182 419,164 466,148 513,134 560,120" fill="none" stroke="#5B4BC4" stroke-width="2.8"/>
+<text x="230" y="200" font-size="14" font-weight="bold" fill="#5B4BC4">&#952; max = arctan ( &#956; cos &#946; )</text>
+
+<line x1="410" y1="168" x2="410" y2="380" stroke="#bbb" stroke-width="1.2" stroke-dasharray="4 3"/>
+<line x1="90" y1="168" x2="410" y2="168" stroke="#bbb" stroke-width="1.2" stroke-dasharray="4 3"/>
+<circle cx="410" cy="168" r="7" fill="#1D8F6C"/>
+<text x="420" y="150" font-size="14" font-weight="bold" fill="#0F6E56">&#956; = 0.88 measured</text>
+<text x="420" y="168" font-size="14" font-weight="bold" fill="#0F6E56">&#952; max = 39.8&#176;</text>
+
+<text x="409" y="80" font-size="12" font-weight="bold" fill="#3B6D11" text-anchor="middle">&#177;15 % on &#956;</text>
+<text x="409" y="98" font-size="12" fill="#3B6D11" text-anchor="middle">&#952; max = 35.4&#176; to 43.8&#176;</text>
+
+<text x="40" y="434" font-size="12" fill="#666">A 15 % error in the measured friction coefficient shifts the capability by about &#177;4&#176; &#8212; the result is not sensitive to it.</text>
+</svg>

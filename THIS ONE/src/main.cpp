@@ -47,6 +47,22 @@ LED led;
 //STEPPER VARIABLES
 int STEP_HZ = 100;
 
+// Ten selectable drive speeds, picked from the panel with the characters
+// 'a'..'j' ('a' = slowest). Lower case on purpose: every other command is
+// upper case or a digit, so this cannot collide with anything.
+//
+// Absolute rather than "faster"/"slower" so the panel always knows the real
+// speed. A dropped character just means one keypress did nothing, instead of
+// the panel's idea of the speed drifting away from the robot's for good.
+//
+// STEP_HZ (100) is level 'd', so the robot behaves exactly as before until
+// something touches the speed.
+//
+// KEEP IN STEP WITH SPEED_LEVELS in rat88_panel.py. test_panel.py compares
+// the two lists and fails if they differ.
+const int STEP_HZ_LEVELS[10] = {25, 50, 75, 100, 125, 150, 175, 200, 250, 300};
+const int STEP_HZ_LEVEL_COUNT = 10;
+
 // Calibrated in the pipe with the robot fully assembled, 7 runs from
 // 32cm-73cm each. Weighted average (total steps / total distance):
 // 12925 steps / 4012mm = 3.222. Individual run ratios ranged 3.13-3.31,
@@ -161,6 +177,9 @@ void sendTelemetry() {
   Serial.print("{\"stepper_drive_dir\":");
   Serial.print(stepper.getDrive());
 
+  Serial.print("{\"step_hz\":");
+  Serial.print(stepper.getStepHz());
+
   Serial.print("{\"actuator\":");
   Serial.print(actuator.getState());
 
@@ -220,6 +239,11 @@ void loop() {
       case 'O': led.off(); break;
 
       default:
+        // Lower case a-j pick a drive speed from STEP_HZ_LEVELS.
+        if (c >= 'a' && c < 'a' + STEP_HZ_LEVEL_COUNT) {
+          stepper.setStepHz(STEP_HZ_LEVELS[c - 'a']);
+          break;
+        }
         // Digits set lamp brightness: '0' = off ... '9' = full.
         // Single characters keep the protocol as-is — no length-prefixed
         // parameter parsing needed, and it stays typeable by hand.

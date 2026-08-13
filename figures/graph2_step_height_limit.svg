@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="440" viewBox="0 0 680 440" font-family="Helvetica, Arial, sans-serif">
+<line x1="90" y1="60" x2="90" y2="380" stroke="#666" stroke-width="1.6"/>
+<line x1="90" y1="380" x2="560" y2="380" stroke="#666" stroke-width="1.6"/>
+
+<text x="90" y="48" font-size="12" fill="#555">required friction coefficient &#956;</text>
+<text x="82" y="384" font-size="12" fill="#555" text-anchor="end">0</text>
+<text x="82" y="277" font-size="12" fill="#555" text-anchor="end">0.4</text>
+<text x="82" y="171" font-size="12" fill="#555" text-anchor="end">0.8</text>
+<text x="82" y="64" font-size="12" fill="#555" text-anchor="end">1.2</text>
+<text x="90" y="399" font-size="12" fill="#555" text-anchor="middle">0</text>
+<text x="224" y="399" font-size="12" fill="#555" text-anchor="middle">2</text>
+<text x="359" y="399" font-size="12" fill="#555" text-anchor="middle">4</text>
+<text x="493" y="399" font-size="12" fill="#555" text-anchor="middle">6</text>
+<text x="325" y="420" font-size="13" fill="#333" text-anchor="middle">step height h (mm)</text>
+
+<polyline points="124,322 157,296 191,276 224,257 291,224 325,209 359,193 426,163 493,132 560,99" fill="none" stroke="#5B4BC4" stroke-width="2.8"/>
+<text x="404" y="252" font-size="13" font-weight="bold" fill="#5B4BC4">required &#956;</text>
+
+<line x1="90" y1="146" x2="560" y2="146" stroke="#1D8F6C" stroke-width="2.8"/>
+<text x="98" y="138" font-size="14" font-weight="bold" fill="#1D8F6C">&#956; = 0.88 measured</text>
+
+<line x1="463" y1="146" x2="463" y2="380" stroke="#bbb" stroke-width="1.2" stroke-dasharray="4 3"/>
+<circle cx="463" cy="146" r="6.5" fill="#1D8F6C"/>
+<text x="472" y="176" font-size="14" font-weight="bold" fill="#1D8F6C">h max = 5.5 mm</text>
+
+<line x1="325" y1="209" x2="325" y2="380" stroke="#C2751A" stroke-width="1.6" stroke-dasharray="5 3"/>
+<circle cx="325" cy="209" r="6" fill="#C2751A"/>
+<text x="316" y="248" font-size="13" font-weight="bold" fill="#C2751A" text-anchor="end">liner edge 3.5 mm</text>
+<text x="316" y="266" font-size="12" fill="#C2751A" text-anchor="end">needs &#956; = 0.64,  SF 1.37</text>
+
+<text x="40" y="434" font-size="12" fill="#666">Vertical step case: F / N = &#8730;(2 r w h &#8722; h&#178;) / (r w &#8722; h)  &#8804;  &#956; cos &#946;      with r w = 23.9 mm</text>
+</svg>

@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="450" viewBox="0 0 680 450" font-family="Helvetica, Arial, sans-serif">
+<polygon points="353,380 353,211 560,79 560,380" fill="#639922" opacity="0.16"/>
+<rect x="90" y="60" width="117" height="320" fill="#E24B4A" opacity="0.12"/>
+<rect x="207" y="60" width="146" height="320" fill="#BA7517" opacity="0.11"/>
+
+<line x1="90" y1="60" x2="90" y2="380" stroke="#666" stroke-width="1.6"/>
+<line x1="90" y1="380" x2="560" y2="380" stroke="#666" stroke-width="1.6"/>
+
+<text x="90" y="48" font-size="12" fill="#555">crack width w (mm)</text>
+<text x="82" y="384" font-size="12" fill="#555" text-anchor="end">0</text>
+<text x="82" y="277" font-size="12" fill="#555" text-anchor="end">2</text>
+<text x="82" y="171" font-size="12" fill="#555" text-anchor="end">4</text>
+<text x="82" y="64" font-size="12" fill="#555" text-anchor="end">6</text>
+<text x="90" y="399" font-size="12" fill="#555" text-anchor="middle">0</text>
+<text x="247" y="399" font-size="12" fill="#555" text-anchor="middle">200</text>
+<text x="403" y="399" font-size="12" fill="#555" text-anchor="middle">400</text>
+<text x="560" y="399" font-size="12" fill="#555" text-anchor="middle">600</text>
+<text x="325" y="420" font-size="13" fill="#333" text-anchor="middle">distance to crack Z (mm)</text>
+
+<line x1="90" y1="380" x2="560" y2="79" stroke="#5B4BC4" stroke-width="2.8"/>
+<text x="470" y="150" font-size="13" font-weight="bold" fill="#5B4BC4" text-anchor="end">resolution limit  w = 3Z / fx</text>
+
+<line x1="207" y1="60" x2="207" y2="380" stroke="#A32D2D" stroke-width="2" stroke-dasharray="6 4"/>
+<line x1="353" y1="60" x2="353" y2="380" stroke="#3B6D11" stroke-width="2.5"/>
+
+<text x="199" y="120" font-size="12" font-weight="bold" fill="#791F1F" text-anchor="end">no stereo</text>
+<text x="199" y="138" font-size="12" fill="#791F1F" text-anchor="end">Z &lt; 150 mm</text>
+<text x="345" y="120" font-size="12" font-weight="bold" fill="#854F0B" text-anchor="end">partial wall only</text>
+<text x="345" y="138" font-size="12" fill="#854F0B" text-anchor="end">far side not in view</text>
+
+<text x="420" y="300" font-size="15" font-weight="bold" fill="#27500A">DETECTABLE</text>
+<text x="420" y="320" font-size="12" fill="#3B6D11">full wall coverage + stereo range</text>
+
+<circle cx="353" cy="211" r="7" fill="#3B6D11"/>
+<text x="362" y="196" font-size="13" font-weight="bold" fill="#27500A">3.2 mm at 336 mm</text>
+<text x="362" y="214" font-size="12" fill="#3B6D11">smallest crack detectable</text>
+<text x="362" y="230" font-size="12" fill="#3B6D11">anywhere on the wall</text>
+
+<text x="40" y="442" font-size="12" fill="#666">w min = 2 n d far / W = 2(3)(156.3) / 296 = 3.17 mm      &#8212; independent of focal length</text>
+</svg>

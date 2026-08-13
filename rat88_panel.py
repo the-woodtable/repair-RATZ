@@ -33,6 +33,7 @@ Wire format out (single characters, no terminator - what main.cpp listens for):
     T/Y        spool servo   180 / 90
     L/O        LED on / off
     Z          zero odometry
+    'a'-'j'    drive speed, one character per level in STEP_HZ_LEVELS
     '0'-'9'    lamp brightness, mapped to 0-255 in firmware
 
 Three different kinds of hardware, so three different kinds of control:
@@ -180,9 +181,9 @@ GEO = {
     "video_right":  QRect(576, 172,  380, 506),
 
     # Vertical lamp slider: big sun (bright) on top, small sun at the bottom.
-    "sun_max":      QRect(58,  194,   48,  55),
-    "slider":       QRect(30,  254,  104, 300),
-    "sun_min":      QRect(66,  560,   37,  42),
+    "sun_max":      QRect(48,  150,   48,  55),
+    "slider":       QRect(20,  204,  104, 300),
+    "sun_min":      QRect(56,  510,   37,  42),
 
     # Boxes match each PNG's own aspect ratio, centred on the mockup position,
     # so fit() has no slack to letterbox away.
@@ -193,9 +194,9 @@ GEO = {
     "can":          QRect(425, 740,  163, 165),
 
     # Automation column down the left, under the lamp slider.
-    "start":        QRect(38,  607,   77,  76),
-    "stop":         QRect(38,  697,   76,  77),
-    "home":         QRect(38,  785,   77,  77),
+    "start":        QRect(38,  587,   77,  76),
+    "stop":         QRect(38,  677,   76,  77),
+    "home":         QRect(38,  765,   77,  77),
     "folder":       QRect(215, 792,  107,  75),
 
     # Odometer. The number is drawn into the pale window in the artwork.
@@ -212,7 +213,7 @@ GEO = {
     "status":       QRect(0,   906, 1280,  48),   # clears the spool at y=905
 }
 
-TITLE_TEXT = "repair rat #64"
+TITLE_TEXT = "repair rat #68"
 
 # ---------------------------------------------------------------------------
 # THE HOOK POSITIONS - single source of truth.
@@ -277,6 +278,30 @@ SPOOL = ("Y", "T", "string out", "wound in", False)
 # The reading is SIGNED - reversing counts down. It is a position along the
 # pipe, not a total-distance trip meter.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# DRIVE SPEED
+#
+#     =  or  +     one step faster
+#     -  or  _     one step slower
+#
+# Ten absolute levels, one character each, lower case so they cannot collide
+# with any other command. Absolute rather than "faster"/"slower" so the panel
+# always knows the real speed: a dropped character costs one keypress instead
+# of leaving the panel permanently wrong about what the robot is doing.
+#
+# MUST MATCH STEP_HZ_LEVELS in "THIS ONE/src/main.cpp". test_panel.py compares
+# the two and fails if they drift.
+#
+# CAUTION: the odometer counts pulses sent, not steps actually taken. Past the
+# speed the motor can pull under load it silently misses steps and the
+# distance reading drifts. Test the top of the range in the pipe before
+# trusting it during a demo.
+# ---------------------------------------------------------------------------
+SPEED_LEVELS = [25, 50, 75, 100, 125, 150, 175, 200, 250, 300]   # steps/sec
+SPEED_CMDS = "abcdefghij"
+SPEED_BOOT_INDEX = 3        # 100 Hz, which is main.cpp's STEP_HZ
+SPEED_FIELD = "step_hz"     # telemetry echo, so the panel can confirm
+
 ODO_CMD_ZERO = "Z"
 ODO_FIELD = "pos_mm"
 ODO_FIELD_FALLBACK = "steps"
@@ -900,13 +925,63 @@ class VideoPane(QLabel):
 # Serial layer - one owner of the port, nothing else touches it
 # ---------------------------------------------------------------------------
 
+# The S3's own native USB CDC. A property of the chip, so it is identical on
+# every OS -- unlike the device NAME, which is COM7 on Windows,
+# /dev/cu.usbmodem101 on macOS and /dev/ttyACM0 on Linux.
+ESPRESSIF_VID = 0x303A
+# USB-serial ADAPTER chips. These are what you flash the CAMERAS through, not
+# the S3 itself, so they are only a fallback.
+ADAPTER_VIDS = {0x1A86,    # CH340
+                0x0403,    # FTDI
+                0x10C4}    # CP210x
+
+
+def describe_ports():
+    """Every serial port, for when detection fails and you need to pick one."""
+    if not HAVE_SERIAL:
+        return ["pyserial is not installed:  pip3 install pyserial"]
+    ports = list(list_ports.comports())
+    if not ports:
+        return ["no serial ports at all — is the cable a data cable, "
+                "and is the S3 powered?"]
+    out = []
+    for p in ports:
+        vid = f"{p.vid:04X}" if p.vid is not None else "----"
+        pid = f"{p.pid:04X}" if p.pid is not None else "----"
+        out.append(f"  {p.device:<22} VID:PID {vid}:{pid}  {p.description}")
+    return out
+
+
 def autodetect_port():
+    """Find the S3 by USB vendor ID, not by the port's name.
+
+    Name matching is what broke this on Windows: the port is called COM7 and
+    described as "USB Serial Device (COM7)" — with a space — so a search for
+    "usbserial" found nothing, while the same board worked fine in a serial
+    monitor. The VID is the same number on every OS.
+    """
     if not HAVE_SERIAL:
         return None
-    for p in list_ports.comports():
-        d = (p.device + " " + (p.description or "")).lower()
-        if any(k in d for k in ("usbserial", "usbmodem", "ttyusb", "ttyacm", "wchusb", "slab")):
-            return p.device
+    ports = list(list_ports.comports())
+    native = [p.device for p in ports if p.vid == ESPRESSIF_VID]
+    if native:
+        if len(native) > 1:
+            print(f"Several Espressif ports: {', '.join(native)} — "
+                  f"using {native[0]}. Use --port to choose.")
+        return native[0]
+
+    adapter = [p.device for p in ports if p.vid in ADAPTER_VIDS]
+    if adapter:
+        print("No native Espressif USB port — the S3 may not be plugged in.")
+        print(f"Falling back to the USB-serial adapter {adapter[0]}. "
+              "If you are trying to FLASH a camera, close this panel first.")
+        return adapter[0]
+
+    # Nothing recognised. One port and no idea what it is still beats SIM.
+    if len(ports) == 1:
+        print(f"Unrecognised USB vendor, but {ports[0].device} is the only "
+              "port — trying it.")
+        return ports[0].device
     return None
 
 
@@ -1130,6 +1205,9 @@ class Panel(QWidget):
         self.led_on = LED_BOOT_ON
         self._led_last = None
         self._gallery = None
+        # Matches main.cpp's STEP_HZ, so the panel is right before you touch
+        # anything rather than claiming a speed the robot is not using.
+        self.speed_index = SPEED_BOOT_INDEX
 
         # The autonomous sequence. None if auto_sequence.py is missing, in
         # which case the panel stays a manual-control panel.
@@ -1521,11 +1599,31 @@ class Panel(QWidget):
         self.led_on = not self.led_on
         self.send(LED_ON if self.led_on else LED_OFF)
 
+    def set_lamp(self, level: int):
+        """Number keys 0-9. Goes through the slider, which emits valueChanged
+        and so reaches the wire by the same path as the mouse."""
+        lo, hi = self.slider.minimum(), self.slider.maximum()
+        self.slider.setValue(min(hi, max(lo, level)))
+
     def nudge_lamp(self, delta: int):
-        """= and - keys. Moves the slider, which emits valueChanged and so
-        goes through on_led - one path to the wire, same as the mouse."""
         lo, hi = self.slider.minimum(), self.slider.maximum()
         self.slider.setValue(min(hi, max(lo, self.slider.value() + delta)))
+
+    def nudge_speed(self, delta: int):
+        """= and - keys. Steps through SPEED_LEVELS and sends that level's
+        character. Clamped at both ends rather than wrapping - wrapping from
+        fastest to slowest mid-run would be a nasty surprise."""
+        i = min(len(SPEED_LEVELS) - 1, max(0, self.speed_index + delta))
+        if i == self.speed_index:
+            return
+        self.speed_index = i
+        self.send(SPEED_CMDS[i])
+
+    def speed_hz(self) -> int:
+        """What the robot is actually running at if it has told us, otherwise
+        what we last asked for."""
+        reported = _as_float(self._telem.get(SPEED_FIELD))
+        return int(reported) if reported else SPEED_LEVELS[self.speed_index]
 
     def stop_all(self):
         """Panic: cancel any sequence, stop the drive, cut the lining actuator.
@@ -1570,10 +1668,12 @@ class Panel(QWidget):
             self.spool.set(False)
         elif e.text().upper() == LED_ON:         # L - lamp on/off
             self.toggle_led()
-        elif e.text() in ("=", "+"):             # brighter
-            self.nudge_lamp(+1)
-        elif e.text() in ("-", "_"):             # dimmer
-            self.nudge_lamp(-1)
+        elif e.text() in ("=", "+"):             # faster
+            self.nudge_speed(+1)
+        elif e.text() in ("-", "_"):             # slower
+            self.nudge_speed(-1)
+        elif e.text().isdigit():                 # lamp brightness, 0-9
+            self.set_lamp(int(e.text()))
         elif k == Qt.Key_Escape:
             self.close()
 
@@ -1713,12 +1813,14 @@ class Panel(QWidget):
             f"hook={HOOK_LABEL.get(self.hook_pos, '?')}   "
             f"lining={self.lining.label()}{motor}   "
             f"spool={self.spool.label()}   "
-            f"lamp={lamp}   sent={self._last_cmd}\n"
+            f"lamp={lamp}   speed={self.speed_hz()}Hz"
+            f"({self.speed_index + 1}/{len(SPEED_LEVELS)})   "
+            f"sent={self._last_cmd}\n"
             f"AUTO[{self.auto.state if self.auto else '-'}] "
             f"{self.auto_status}   "
             f"{cv_txt}   {tel}     "
             f"[{'/'.join(HOOK_LABEL)}]=hook  [D/R]=lining  [T/Y]=spool  "
-            "[L]=lamp  [-/=]=bright  [space]=stop  [esc]=quit")
+            "[L]=lamp  [0-9]=bright  [-/=]=speed  [space]=stop  [esc]=quit")
 
     def closeEvent(self, e):
         """Runs whether or not the status strip is shown. Without it the drive
@@ -1754,17 +1856,18 @@ def main():
     args = ap.parse_args()
 
     if args.list:
-        if not HAVE_SERIAL:
-            print("pyserial not installed:  pip3 install pyserial")
-        else:
-            for p in list_ports.comports():
-                print(f"{p.device:32s} {p.description}")
+        print("\n".join(describe_ports()))
+        found = autodetect_port()
+        print(f"\nautodetect would use: {found or 'nothing — pass --port'}")
         return 0
 
     port = None if args.sim else (args.port or autodetect_port())
     if not args.sim and not port:
-        print("No serial port found — starting in SIM mode. "
-              "Use --list to see ports, or --port to pick one.")
+        print("No serial port found — starting in SIM mode.\n"
+              "Ports this computer can see:")
+        print("\n".join(describe_ports()))
+        print("Pick one with:  python3 rat88_panel.py --port <name>\n"
+              "On Windows that looks like:  --port COM7")
 
     problems = check_assets()
     if problems:

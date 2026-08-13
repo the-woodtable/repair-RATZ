@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="450" viewBox="0 0 680 450" font-family="Helvetica, Arial, sans-serif">
+<defs>
+<marker id="aK" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#444"/></marker>
+<marker id="aP" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#5B4BC4"/></marker>
+<marker id="aG" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#1D8F6C"/></marker>
+<marker id="aO" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#C2751A"/></marker>
+</defs>
+
+<line x1="60" y1="320" x2="280" y2="320" stroke="#444" stroke-width="2.5"/>
+<line x1="280" y1="320" x2="580" y2="180" stroke="#444" stroke-width="2.5"/>
+<line x1="280" y1="320" x2="580" y2="320" stroke="#bbb" stroke-width="1.2" stroke-dasharray="6 4"/>
+
+<text x="150" y="342" font-size="12" fill="#666">pipe wall</text>
+<text x="520" y="160" font-size="12" fill="#666" text-anchor="end">obstacle surface</text>
+
+<path d="M 340 320 A 60 60 0 0 0 334.4 294.6" fill="none" stroke="#C2751A" stroke-width="1.8"/>
+<text x="352" y="312" font-size="15" font-weight="bold" fill="#C2751A">&#952;</text>
+
+<circle cx="376.8" cy="214.2" r="55" fill="none" stroke="#888" stroke-width="2.2"/>
+<circle cx="376.8" cy="214.2" r="4" fill="#888"/>
+<circle cx="400" cy="264" r="4" fill="#444"/>
+
+<line x1="400" y1="264" x2="357" y2="171.8" stroke="#1D8F6C" stroke-width="2.8" marker-end="url(#aG)"/>
+<text x="330" y="166" font-size="15" font-weight="bold" fill="#1D8F6C">N &#8242;</text>
+
+<line x1="400" y1="264" x2="472" y2="230.4" stroke="#C2751A" stroke-width="2.8" marker-end="url(#aO)"/>
+<text x="480" y="228" font-size="14" font-weight="bold" fill="#C2751A">f &#8804; &#956; N &#8242;</text>
+
+<line x1="376.8" y1="214.2" x2="496.8" y2="214.2" stroke="#5B4BC4" stroke-width="2.8" marker-end="url(#aP)"/>
+<text x="440" y="205" font-size="14" font-weight="bold" fill="#5B4BC4" text-anchor="middle">F (axial)</text>
+
+<line x1="40" y1="360" x2="640" y2="360" stroke="#bbb" stroke-width="1"/>
+<text x="40" y="386" font-size="15" font-weight="bold" fill="#333">Demand:   F  =  &#931;N i &#183; tan &#952;            Capability:   F a, max  =  &#956; cos &#946; &#183; &#931;N i</text>
+<text x="40" y="412" font-size="15" font-weight="bold" fill="#5B4BC4">&#931;N i tan &#952;  &#8804;  &#956; cos &#946; &#183; &#931;N i     &#8658;     &#952; max  =  arctan ( &#956; cos &#946; )  =  39.8&#176;</text>
+<text x="40" y="436" font-size="13" fill="#555">&#931;N i cancels &#8212; maximum steepness is independent of mass, preload and wheel radius.</text>
+</svg>

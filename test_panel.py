@@ -156,6 +156,9 @@ def make_panel():
         on_led = R.Panel.on_led
         toggle_led = R.Panel.toggle_led
         nudge_lamp = R.Panel.nudge_lamp
+        set_lamp = R.Panel.set_lamp
+        nudge_speed = R.Panel.nudge_speed
+        speed_hz = R.Panel.speed_hz
         on_lining = R.Panel.on_lining
         on_spool = R.Panel.on_spool
         on_hook = R.Panel.on_hook
@@ -174,6 +177,7 @@ def make_panel():
     p = P()
     P.sent = []
     p.led_on = R.LED_BOOT_ON
+    p.speed_index = R.SPEED_BOOT_INDEX
     p._led_last = None
     p._telem = {}
     p._telem_seen = 0.0
@@ -442,7 +446,7 @@ def _():
     assert p.can_btn.sel is True and p.sent[-1] == "D"
 
 
-@check("lamp: L toggles, =/- step and clamp, digits imply on/off")
+@check("lamp: L toggles, stepping clamps, digits imply on/off")
 def _():
     p = make_panel()
     assert p.led_on is False
@@ -451,18 +455,111 @@ def _():
     p.keyPressEvent(FakeKey("L"))
     assert p.sent[-1] == "O" and p.led_on is False
 
-    p.keyPressEvent(FakeKey("-"))
+    # =/- are drive speed now; brightness is on the number keys and on
+    # nudge_lamp, which the slider widget still uses.
+    p.nudge_lamp(-1)
     assert p.slider.value() == 8 and p.sent[-1] == "8"
     assert p.led_on is True, "any digit above 0 lights the lamp in firmware"
-    p.keyPressEvent(FakeKey("="))
+    p.nudge_lamp(+1)
     assert p.slider.value() == 9
-    p.keyPressEvent(FakeKey("="))
+    p.nudge_lamp(+1)
     assert p.slider.value() == 9, "must clamp at maximum"
     for _ in range(9):
-        p.keyPressEvent(FakeKey("-"))
+        p.nudge_lamp(-1)
     assert p.slider.value() == 0 and p.led_on is False, "'0' turns the lamp off"
-    p.keyPressEvent(FakeKey("-"))
+    p.nudge_lamp(-1)
     assert p.slider.value() == 0, "must clamp at minimum"
+
+
+@check("speed: panel levels match STEP_HZ_LEVELS in main.cpp")
+def _():
+    fw = open(FW).read()
+    m = re.search(r"STEP_HZ_LEVELS\[\d*\]\s*=\s*\{([^}]*)\}", fw)
+    assert m, "STEP_HZ_LEVELS is missing from main.cpp"
+    fw_levels = [int(x) for x in m.group(1).replace(" ", "").split(",") if x]
+    assert fw_levels == R.SPEED_LEVELS, \
+        f"firmware has {fw_levels}, panel has {R.SPEED_LEVELS}"
+    assert len(R.SPEED_CMDS) == len(R.SPEED_LEVELS), \
+        "one command character per level"
+    assert len(set(R.SPEED_CMDS)) == len(R.SPEED_CMDS), "duplicate speed chars"
+    # The firmware decodes with c - 'a', so the characters must be contiguous
+    # from 'a' and in the same order as the table.
+    assert R.SPEED_CMDS == "".join(
+        chr(ord("a") + i) for i in range(len(R.SPEED_LEVELS))), R.SPEED_CMDS
+    m2 = re.search(r"c >= 'a' && c < 'a' \+ STEP_HZ_LEVEL_COUNT", fw)
+    assert m2, "main.cpp no longer decodes the speed characters"
+
+
+@check("speed: boot level is the firmware's STEP_HZ")
+def _():
+    fw = open(FW).read()
+    m = re.search(r"int STEP_HZ\s*=\s*(\d+)", fw)
+    assert m, "STEP_HZ is gone from main.cpp"
+    assert R.SPEED_LEVELS[R.SPEED_BOOT_INDEX] == int(m.group(1)), \
+        (f"panel starts at {R.SPEED_LEVELS[R.SPEED_BOOT_INDEX]}Hz but the "
+         f"firmware boots at {m.group(1)}Hz")
+
+
+@check("speed: = and - step one level and clamp at both ends")
+def _():
+    p = make_panel()
+    start = p.speed_index
+    p.keyPressEvent(FakeKey("="))
+    assert p.speed_index == start + 1
+    assert p.sent[-1] == R.SPEED_CMDS[start + 1], p.sent
+    p.keyPressEvent(FakeKey("-"))
+    assert p.speed_index == start and p.sent[-1] == R.SPEED_CMDS[start]
+
+    for _i in range(len(R.SPEED_LEVELS) + 5):
+        p.keyPressEvent(FakeKey("+"))
+    assert p.speed_index == len(R.SPEED_LEVELS) - 1, "did not clamp at the top"
+    p.sent.clear()
+    p.keyPressEvent(FakeKey("="))
+    assert p.sent == [], "already fastest — should not re-send"
+
+    for _i in range(len(R.SPEED_LEVELS) + 5):
+        p.keyPressEvent(FakeKey("_"))
+    assert p.speed_index == 0, "did not clamp at the bottom"
+    assert p.speed_hz() == R.SPEED_LEVELS[0]
+
+
+@check("speed: telemetry wins over what we asked for")
+def _():
+    p = make_panel()
+    assert p.speed_hz() == R.SPEED_LEVELS[R.SPEED_BOOT_INDEX]
+    p.on_telemetry('{"step_hz":250}')
+    assert p.speed_hz() == 250, \
+        "the panel ignored the speed the robot reported"
+
+
+@check("lamp: number keys set brightness directly")
+def _():
+    p = make_panel()
+    p.keyPressEvent(FakeKey("0"))
+    assert p.slider.value() == 0 and p.sent[-1] == "0"
+    assert p.led_on is False, "'0' turns the lamp off in firmware"
+    p.keyPressEvent(FakeKey("7"))
+    assert p.slider.value() == 7 and p.sent[-1] == "7" and p.led_on is True
+    p.keyPressEvent(FakeKey("9"))
+    assert p.slider.value() == 9 and p.sent[-1] == "9"
+
+
+@check("speed: lower-case levels cannot collide with any other command")
+def _():
+    # main.cpp matches speed on LOWER case a-j and everything else on upper
+    # case or a digit, so the separation only holds while every other command
+    # stays upper case.
+    others = (set(R.HOOK_LABEL) | {R.LINING[0], R.LINING[1], R.SPOOL[0],
+                                   R.SPOOL[1], R.LED_ON, R.LED_OFF,
+                                   R.ODO_CMD_ZERO, "F", "B", "S", "X"})
+    for ch in others:
+        assert ch.isupper(), \
+            f"{ch!r} is lower case — it now collides with the speed range"
+    assert set(R.SPEED_CMDS).isdisjoint(others)
+    fw = open(FW).read()
+    cases = set(re.findall(r"case '(.)':", fw))
+    assert set(R.SPEED_CMDS).isdisjoint(cases), \
+        f"a speed character is also a switch case: {set(R.SPEED_CMDS) & cases}"
 
 
 @check("keyboard: no two controls share a letter")
@@ -965,6 +1062,58 @@ def _():
             assert r.x() >= 0 and r.y() >= 0, (w, h, key)
             assert r.x() + r.width() <= w + 1, (w, h, key)
             assert r.y() + r.height() <= h + 1, (w, h, key)
+
+
+@check("ports: found by USB vendor id on Windows, macOS and Linux")
+def _():
+    import types
+
+    class Port:
+        def __init__(self, device, vid=None, pid=None, desc=""):
+            self.device, self.vid, self.pid = device, vid, pid
+            self.description = desc
+
+    saved_have, saved_lp = R.HAVE_SERIAL, getattr(R, "list_ports", None)
+
+    def set_ports(ports):
+        R.HAVE_SERIAL = True
+        R.list_ports = types.SimpleNamespace(comports=lambda: ports)
+
+    try:
+        # The case that actually broke: on Windows the port is COM7 and the
+        # description is "USB Serial Device (COM7)" — with a space — so
+        # matching on the string "usbserial" found nothing.
+        set_ports([Port("COM7", R.ESPRESSIF_VID, 0x1001,
+                        "USB Serial Device (COM7)")])
+        assert R.autodetect_port() == "COM7", R.autodetect_port()
+
+        for dev in ("/dev/cu.usbmodem101", "/dev/ttyACM0"):
+            set_ports([Port(dev, R.ESPRESSIF_VID, 0x1001, "ESP32-S3")])
+            assert R.autodetect_port() == dev, dev
+
+        # The S3 must win over the CH340 you flash cameras through, whichever
+        # order they happen to enumerate in.
+        s3 = Port("COM7", R.ESPRESSIF_VID, 0x1001, "USB Serial Device (COM7)")
+        ch340 = Port("COM3", 0x1A86, 0x7523, "USB-SERIAL CH340 (COM3)")
+        for order in ([ch340, s3], [s3, ch340]):
+            set_ports(order)
+            assert R.autodetect_port() == "COM7", order
+
+        set_ports([ch340])
+        assert R.autodetect_port() == "COM3", "adapter-only should still work"
+
+        set_ports([Port("COM9", 0x2341, 0x0043, "Arduino Uno (COM9)")])
+        assert R.autodetect_port() == "COM9", "one unknown port beats SIM mode"
+        set_ports([Port("COM9", 0x2341, 1), Port("COM10", 0x2341, 2)])
+        assert R.autodetect_port() is None, "two unknowns is ambiguous"
+
+        set_ports([])
+        assert R.autodetect_port() is None
+        assert "no serial ports" in "\n".join(R.describe_ports())
+    finally:
+        R.HAVE_SERIAL = saved_have
+        if saved_lp is not None:
+            R.list_ports = saved_lp
 
 
 @check("safety: closeEvent exists and stops the link")

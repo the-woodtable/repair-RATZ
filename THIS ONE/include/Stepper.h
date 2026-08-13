@@ -11,6 +11,16 @@ public:
   void setDrive(int8_t dir);   // -1 = backward, 0 = stop, +1 = forward
   void zero();                 // reset step count to 0
 
+  // Change speed while running. Safe to call mid-move: it only rewrites the
+  // timer alarm period, so the step count and direction are untouched.
+  //
+  // CAUTION: the odometer counts pulses SENT, not steps actually taken. Wind
+  // this up past what the motor can pull and it silently misses steps, so the
+  // distance reading drifts without anything looking wrong. Test the top of
+  // the range in the pipe, loaded, before relying on it.
+  void setStepHz(int hz);
+  int  getStepHz() const;
+
   long getStepCount() const;
   int8_t getDrive() const;
 
@@ -19,6 +29,7 @@ private:
   int pin_dir_;
   int pin_en_;
   int stepsPerRev_;
+  int stepHz_ = 0;         // last commanded speed, so the panel can read it back
 
   hw_timer_t* timer_ = nullptr;
 
