@@ -64,7 +64,7 @@ CALIB_DIR   = os.path.join(DATA_DIR, "calib_pairs")
 # AUTO_PAUSE_TRIGGER_CONF (0.5, worth a closer look) but below AUTO_DEPLOY_CONF
 # (0.8, confident enough to act on automatically). One screenshot per crack ID.
 SCREENSHOT_CONF_MIN = 0.4
-SCREENSHOT_CONF_MAX = 0.79
+SCREENSHOT_CONF_MAX = 0.69
 # Screenshots only happen while a scan is actively running, from START
 # through the lining being deployed -- not while idle/manually driving, and
 # not once POST_DEPLOY_WAIT/RETRACTING_AUTO/RETURNING_HOME start (deployed).
@@ -94,7 +94,7 @@ CV_CONF = 0.4
 # controls the much bigger decision of "stop and reposition for a human to
 # look at this" -- a false positive here wastes travel distance and an
 # operator's attention, so it's set high on purpose.
-AUTO_DEPLOY_CONF = 0.60
+AUTO_DEPLOY_CONF = 0.75
 # Lower bar: a detection needs at least this much confidence to make the
 # robot stop and take a closer look at all. Below this, it's ignored and
 # scanning continues -- only detections at or above this get a second look.
@@ -110,17 +110,11 @@ POST_DEPLOY_WAIT_SECS = 5.0
 # mode flag -- 0 idle, +1 extending, -1 retracting -- that goes still the
 # INSTANT motion starts, not when it finishes; there's no position feedback
 # or limit switch. So completion can't be detected, only timed. Measured
-# both deploy and retract at exactly 10s (stopwatch, current ACT_SPEED).
-#
-# This MUST NOT exceed Actuator::MAX_RUN_MS (10000ms in Actuator.h) -- that
-# cutoff is what actually stops the motor, so a longer wait here does not run
-# the actuator for longer, it just leaves the sequence believing it is still
-# deploying after the motor has already stopped. It used to be 13.0 for "3s of
-# margin", which the firmware never allowed to happen.
-#
-# Re-measure and adjust if ACT_SPEED changes, or split into two constants if
-# deploy and retract ever need different durations.
-ACTUATOR_RUN_SECS = 10.0
+# both deploy and retract at exactly 10s (stopwatch, current ACT_SPEED) --
+# this adds a 3s margin so a slightly slower run still finishes. Re-measure
+# and adjust if ACT_SPEED changes, or split into two constants if deploy and
+# retract ever need different durations.
+ACTUATOR_RUN_SECS = 13.0
 # How close to "home" (position 0, i.e. wherever ZERO ODOM was last pressed)
 # counts as arrived, when driving back via the RETURN HOME button, in mm.
 HOME_TOLERANCE_MM = 2.0

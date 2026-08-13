@@ -42,24 +42,15 @@ except ImportError:
 AUTO_PAUSE_TRIGGER_CONF = 0.5
 # ...and this much, averaged, to actually commit to deploying a lining. Much
 # higher on purpose: a false positive here wastes travel and operator time.
-AUTO_DEPLOY_CONF = 0.60
+AUTO_DEPLOY_CONF = 0.75
 # How far to drive PAST a confirmed crack before deploying, in mm.
 AUTO_REPOSITION_MM = 30.0
 PRE_DEPLOY_WAIT_SECS = 5.0
 POST_DEPLOY_WAIT_SECS = 5.0
 # The actuator has no position feedback and no limit switch - telemetry's
 # "actuator" field is a mode flag that goes still the instant motion starts.
-# Completion cannot be detected, only timed.
-#
-# This MUST NOT exceed Actuator::MAX_RUN_MS in THIS ONE/include/Actuator.h
-# (10000ms), because that is what actually cuts the motor. Waiting longer does
-# not run the actuator for longer - it just leaves the sequence believing it
-# is still deploying for seconds after the motor already stopped, and the
-# panel counting down to a moment that has passed.
-#
-# Deploy and retract were both measured at 10s, so this matches the firmware
-# cutoff exactly. If you need real margin, raise MAX_RUN_MS first, then this.
-ACTUATOR_RUN_SECS = 10.0
+# Completion cannot be detected, only timed. Measured at 10s; 13 gives margin.
+ACTUATOR_RUN_SECS = 13.0
 # Close enough to home to call it arrived, in mm.
 HOME_TOLERANCE_MM = 2.0
 # Ticks to wait after stopping before trusting a confidence reading - the
@@ -72,7 +63,7 @@ AUTO_PAUSE_CONFIRM_TICKS = 15
 # Ambiguous cracks - confident enough to be worth a human look, not confident
 # enough to act on - get one screenshot each.
 SCREENSHOT_CONF_MIN = 0.4
-SCREENSHOT_CONF_MAX = 0.79
+SCREENSHOT_CONF_MAX = 0.69
 # Only while a scan is actually running, and only before the lining goes out.
 SCREENSHOT_ACTIVE_STATES = frozenset(
     {"SCANNING", "PAUSED", "REPOSITIONING", "PRE_DEPLOY_WAIT", "DEPLOYING"})
@@ -119,9 +110,6 @@ class AutoSequence:
 
         self._confs = []
         self._pause_ticks = 0
-        # Per-instance copy of the deploy bar so the panel's C key can change
-        # it at runtime. AUTO_DEPLOY_CONF is only the starting value.
-        self.deploy_conf = AUTO_DEPLOY_CONF
         self._reposition_start_mm = None
         self._wait_started_t = 0.0
         self._act_started_t = 0.0
@@ -145,15 +133,6 @@ class AutoSequence:
     @property
     def running(self):
         return self.state != "IDLE"
-
-    def set_deploy_conf(self, value: float):
-        """Change the bar for committing to a lining, while running.
-
-        This is NOT the detection threshold. YOLO still reports everything
-        above CV_CONF (0.4) and the panel still draws it; this only moves the
-        point at which the robot decides a crack is worth acting on.
-        """
-        self.deploy_conf = float(value)
 
     def ensure_dir(self):
         if self.inspection_dir is None:
@@ -242,7 +221,7 @@ class AutoSequence:
                   f"({len(self._confs)}/{AUTO_PAUSE_CONFIRM_TICKS})")
         if len(self._confs) < AUTO_PAUSE_CONFIRM_TICKS:
             return
-        if avg >= self.deploy_conf:
+        if avg >= AUTO_DEPLOY_CONF:
             self.state = "REPOSITIONING"
             self._reposition_start_mm = self.get_pos_mm()
             self._drive(1)
