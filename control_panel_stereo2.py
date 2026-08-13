@@ -60,11 +60,14 @@ DATASET_DIR = os.path.join(DATA_DIR, "dataset")
 CALIB_DIR   = os.path.join(DATA_DIR, "calib_pairs")
 
 # Ambiguous-crack review: confirmed detections with confidence in this range
-# are screenshotted for a human to double-check later -- above
-# AUTO_PAUSE_TRIGGER_CONF (0.5, worth a closer look) but below AUTO_DEPLOY_CONF
-# (0.8, confident enough to act on automatically). One screenshot per crack ID.
+# are screenshotted for a human to double-check later. Covers the full
+# range from AUTO_PAUSE_TRIGGER_CONF (0.5, worth a closer look) up to 1.0 --
+# this INCLUDES cracks confident enough to auto-deploy on
+# (AUTO_DEPLOY_CONF, currently 0.7), so a photo exists for every crack the
+# robot acts on, not just the ambiguous ones below the deploy bar. One
+# screenshot per crack ID.
 SCREENSHOT_CONF_MIN = 0.4
-SCREENSHOT_CONF_MAX = 0.69
+SCREENSHOT_CONF_MAX = 1.0
 # Screenshots only happen while a scan is actively running, from START
 # through the lining being deployed -- not while idle/manually driving, and
 # not once POST_DEPLOY_WAIT/RETRACTING_AUTO/RETURNING_HOME start (deployed).
@@ -94,13 +97,13 @@ CV_CONF = 0.4
 # controls the much bigger decision of "stop and reposition for a human to
 # look at this" -- a false positive here wastes travel distance and an
 # operator's attention, so it's set high on purpose.
-AUTO_DEPLOY_CONF = 0.70
+AUTO_DEPLOY_CONF = 0.7
 # Lower bar: a detection needs at least this much confidence to make the
 # robot stop and take a closer look at all. Below this, it's ignored and
 # scanning continues -- only detections at or above this get a second look.
 AUTO_PAUSE_TRIGGER_CONF = 0.5
 # How far to drive FORWARD, past a confirmed crack, before deploying, in mm.
-AUTO_REPOSITION_MM = 30.0
+AUTO_REPOSITION_MM = 10.0
 # Wait after reaching the reposition point, before extending the actuator.
 PRE_DEPLOY_WAIT_SECS = 5.0
 # Wait after the lining is fully deployed, before retracting.

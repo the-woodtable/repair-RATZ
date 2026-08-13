@@ -42,10 +42,9 @@ except ImportError:
 AUTO_PAUSE_TRIGGER_CONF = 0.5
 # ...and this much, averaged, to actually commit to deploying a lining. Much
 # higher on purpose: a false positive here wastes travel and operator time.
-AUTO_DEPLOY_CONF = 0.70
-
+AUTO_DEPLOY_CONF = 0.7
 # How far to drive PAST a confirmed crack before deploying, in mm.
-AUTO_REPOSITION_MM = 30.0
+AUTO_REPOSITION_MM = 10.0
 PRE_DEPLOY_WAIT_SECS = 5.0
 POST_DEPLOY_WAIT_SECS = 5.0
 # The actuator has no position feedback and no limit switch - telemetry's
@@ -61,10 +60,11 @@ AUTO_PAUSE_SETTLE_TICKS = 5
 # lighting flicker or a partial view.
 AUTO_PAUSE_CONFIRM_TICKS = 15
 
-# Ambiguous cracks - confident enough to be worth a human look, not confident
-# enough to act on - get one screenshot each.
+# Cracks worth a human double-check get a screenshot -- the full range from
+# AUTO_PAUSE_TRIGGER_CONF up to 1.0, which now INCLUDES cracks confident
+# enough to auto-deploy on, so every acted-on crack has a photo too.
 SCREENSHOT_CONF_MIN = 0.4
-SCREENSHOT_CONF_MAX = 0.69
+SCREENSHOT_CONF_MAX = 1.0
 # Only while a scan is actually running, and only before the lining goes out.
 SCREENSHOT_ACTIVE_STATES = frozenset(
     {"SCANNING", "PAUSED", "REPOSITIONING", "PRE_DEPLOY_WAIT", "DEPLOYING"})

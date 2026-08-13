@@ -45,7 +45,7 @@ IMU imu;
 LED led;
 
 //STEPPER VARIABLES
-int STEP_HZ = 50;
+int STEP_HZ = 40;
 
 // Ten selectable drive speeds, picked from the panel with the characters
 // 'a'..'j' ('a' = slowest). Lower case on purpose: every other command is
@@ -55,12 +55,12 @@ int STEP_HZ = 50;
 // speed. A dropped character just means one keypress did nothing, instead of
 // the panel's idea of the speed drifting away from the robot's for good.
 //
-// STEP_HZ (100) is level 'd', so the robot behaves exactly as before until
+// STEP_HZ (40) is level 'b', so the robot behaves exactly as before until
 // something touches the speed.
 //
 // KEEP IN STEP WITH SPEED_LEVELS in rat88_panel.py. test_panel.py compares
 // the two lists and fails if they differ.
-const int STEP_HZ_LEVELS[10] = {25, 50, 75, 100, 125, 150, 175, 200, 250, 300};
+const int STEP_HZ_LEVELS[10] = {25, 40, 75, 100, 125, 150, 175, 200, 250, 300};
 const int STEP_HZ_LEVEL_COUNT = 10;
 
 // Calibrated in the pipe with the robot fully assembled, 7 runs from
@@ -72,7 +72,7 @@ const int STEP_HZ_LEVEL_COUNT = 10;
 float STEPS_PER_MM = 3.222f;
 
 //ACTUATOR VARIABLES
-int ACT_SPEED = 50;   // 0-255, default speed for jog commands
+int ACT_SPEED = 40;   // 0-255, default speed for jog commands
 
 //OTHER VARIABLES
 bool setupSuccessful = true;

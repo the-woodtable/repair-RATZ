@@ -304,9 +304,9 @@ SPOOL = ("Y", "T", "string out", "wound in", False)
 # distance reading drifts. Test the top of the range in the pipe before
 # trusting it during a demo.
 # ---------------------------------------------------------------------------
-SPEED_LEVELS = [25, 50, 75, 100, 125, 150, 175, 200, 250, 300]   # steps/sec
+SPEED_LEVELS = [25, 40, 75, 100, 125, 150, 175, 200, 250, 300]   # steps/sec
 SPEED_CMDS = "abcdefghij"
-SPEED_BOOT_INDEX = 1        # 50 Hz, which is main.cpp's STEP_HZ
+SPEED_BOOT_INDEX = 1        # 40 Hz, which is main.cpp's STEP_HZ
 SPEED_FIELD = "step_hz"     # telemetry echo, so the panel can confirm
 
 # C cycles the crack-detection threshold between these. Panel-side only -
@@ -322,7 +322,7 @@ SPEED_FIELD = "step_hz"     # telemetry echo, so the panel can confirm
 #   2. PAUSE TRIGGER, 0.5   (auto_sequence.AUTO_PAUSE_TRIGGER_CONF)
 #      Enough to make the robot stop and take a proper look.
 #
-#   3. DEPLOY, 0.6   (auto_sequence.AUTO_DEPLOY_CONF)
+#   3. DEPLOY, 0.7   (auto_sequence.AUTO_DEPLOY_CONF)
 #      Averaged over AUTO_PAUSE_CONFIRM_TICKS, the bar for actually committing
 #      a lining. THIS is what C toggles, because it is the decision with a
 #      physical consequence.
@@ -1728,9 +1728,10 @@ class Panel(QWidget):
 
     @property
     def deploy_conf(self) -> float:
-        """The bar for committing a lining. Read from the sequence rather than
-        kept here, so there is only one copy of it to be wrong."""
-        return self.auto.deploy_conf if self.auto else auto.AUTO_DEPLOY_CONF
+        """The bar for committing a lining. Fixed constant from
+        auto_sequence.py -- AutoSequence itself has no such attribute,
+        so read the module constant directly instead of guessing at one."""
+        return auto.AUTO_DEPLOY_CONF
 
     @property
     def det_conf(self) -> float:
@@ -1875,11 +1876,6 @@ class Panel(QWidget):
                     self._det_count_l = 0
                 else:
                     self._det_count_r = 0
-
-            # Always, detections or not - the threshold matters MOST when
-            # nothing is being found, because "no cracks here" and "the bar is
-            # set too high" look identical on screen otherwise.
-            bgr = scv.draw_conf_badge(bgr, self.det_conf, self.deploy_conf)
 
         pane.show_frame(bgr_to_qimage(bgr))
 
