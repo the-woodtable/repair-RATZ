@@ -73,6 +73,7 @@ class FakeButton:
 
     def __init__(self):
         self.sel = None
+        self.enabled = True
         self.clicked = FakeSignal()
 
     def set_selected(self, v):
@@ -82,6 +83,12 @@ class FakeButton:
         return bool(self.sel)
 
     def setDown(self, v):
+        pass
+
+    def setEnabled(self, v):
+        self.enabled = v
+
+    def setToolTip(self, _t):
         pass
 
     def click(self):
@@ -157,6 +164,8 @@ def make_panel():
         toggle_led = R.Panel.toggle_led
         nudge_lamp = R.Panel.nudge_lamp
         set_lamp = R.Panel.set_lamp
+        deploy_conf = R.Panel.deploy_conf
+        det_conf = R.Panel.det_conf
         nudge_speed = R.Panel.nudge_speed
         speed_hz = R.Panel.speed_hz
         on_lining = R.Panel.on_lining
@@ -173,11 +182,14 @@ def make_panel():
         update_odometer = R.Panel.update_odometer
         keyPressEvent = R.Panel.keyPressEvent
         refresh_status = R.Panel.refresh_status
+        _act_timeout = R.Panel._act_timeout
 
     p = P()
     P.sent = []
     p.led_on = R.LED_BOOT_ON
     p.speed_index = R.SPEED_BOOT_INDEX
+    p.cv = None
+    p._act_timer = None
     p._led_last = None
     p._telem = {}
     p._telem_seen = 0.0
@@ -252,13 +264,22 @@ def _():
             f"'{ch}' is not an actuator command in main.cpp"
 
 
-@check("firmware: ACT_RUN_S matches Actuator::MAX_RUN_MS")
+@check("firmware: the actuator run time is not longer than the firmware cutoff")
 def _():
     hdr = open(os.path.join(HERE, "THIS ONE", "include", "Actuator.h")).read()
     m = re.search(r"MAX_RUN_MS\s*=\s*(\d+)", hdr)
     assert m, "cannot find MAX_RUN_MS"
-    assert abs(R.ACT_RUN_S - int(m.group(1)) / 1000.0) < 0.01, \
-        f"panel counts down {R.ACT_RUN_S}s, firmware cuts at {int(m.group(1))/1000}s"
+    cutoff = int(m.group(1)) / 1000.0
+    # Actuator::update() kills the motor at MAX_RUN_MS no matter what. Asking
+    # for longer does not run it for longer - it just makes the countdown, and
+    # the auto sequence's idea of when the move finished, wrong.
+    assert R.ACT_RUN_S <= cutoff + 0.01, (
+        f"the panel runs the actuator for {R.ACT_RUN_S}s but the firmware "
+        f"cuts it at {cutoff}s. Raise MAX_RUN_MS in Actuator.h, or lower "
+        f"ACTUATOR_RUN_SECS in auto_sequence.py.")
+    assert auto.ACTUATOR_RUN_SECS <= cutoff + 0.01, (
+        f"auto_sequence waits {auto.ACTUATOR_RUN_SECS}s for a deploy that the "
+        f"firmware stops at {cutoff}s")
 
 
 @check("firmware: lamp boots off, and a digit implies on/off")
@@ -560,6 +581,48 @@ def _():
     cases = set(re.findall(r"case '(.)':", fw))
     assert set(R.SPEED_CMDS).isdisjoint(cases), \
         f"a speed character is also a switch case: {set(R.SPEED_CMDS) & cases}"
+
+
+@check("conf: the threshold is visible on the video, not only in the strip")
+def _():
+    try:
+        import numpy as np
+    except ImportError:
+        return
+    import showcase_cv as scv
+    blank = np.zeros((320, 240, 3), np.uint8)
+    out = scv.draw_conf_badge(blank.copy(), 0.40, 0.60)
+    assert out.sum() > 0, "the badge drew nothing"
+    h, w = out.shape[:2]
+    assert out[:h // 2, :].sum() == 0, "the badge covers the picture"
+    assert out[h - 40:, :w // 2].sum() > 0, "the badge is not bottom-left"
+    assert not np.array_equal(scv.draw_conf_badge(blank.copy(), 0.4, 0.60),
+                              scv.draw_conf_badge(blank.copy(), 0.4, 0.80)), \
+        "0.60 and 0.80 render identically — you could not tell them apart"
+    assert not np.array_equal(scv.draw_conf_badge(blank.copy(), 0.40, 0.6),
+                              scv.draw_conf_badge(blank.copy(), 0.55, 0.6)), \
+        "the detection threshold is not shown — only the deploy bar is"
+
+
+@check("conf: set_conf updates the tracker, not just the worker")
+def _():
+    import showcase_cv as scv
+
+    class T:
+        conf_threshold = 0.4
+    w = object.__new__(scv.CVWorker)
+    w.conf = 0.4
+    w.tracker_l, w.tracker_r = T(), T()
+    w.set_conf(0.8)
+    assert w.conf == 0.8
+    assert w.tracker_l.conf_threshold == 0.8, \
+        "YOLO reads conf_threshold on every call; setting only worker.conf " \
+        "would change the label and nothing else"
+    assert w.tracker_r.conf_threshold == 0.8, \
+        "the right camera's tracker was left on the old threshold"
+    w.tracker_l = w.tracker_r = None
+    w.set_conf(0.6)                             # must not raise with no model
+    assert w.conf == 0.6
 
 
 @check("keyboard: no two controls share a letter")
@@ -894,6 +957,42 @@ def _():
     for st in ("POST_DEPLOY_WAIT", "RETRACTING_AUTO", "RETURNING_HOME"):
         assert st not in auto.SCREENSHOT_ACTIVE_STATES, \
             f"{st} would screenshot with the lining already out"
+
+
+@check("conf: the deploy bar is 0.6 and there is exactly one copy of it")
+def _():
+    assert auto.AUTO_DEPLOY_CONF == 0.6, \
+        f"deploy bar is {auto.AUTO_DEPLOY_CONF}, expected 0.6"
+    old = open(os.path.join(HERE, "control_panel_stereo2.py")).read()
+    m = re.search(r"AUTO_DEPLOY_CONF\s*=\s*([\d.]+)", old)
+    assert m and abs(float(m.group(1)) - auto.AUTO_DEPLOY_CONF) < 1e-9, \
+        f"the other panel deploys at {m.group(1)}, this one at "
+    p = make_panel()
+    assert p.deploy_conf == auto.AUTO_DEPLOY_CONF, \
+        "the panel shows a different deploy bar than the sequence uses"
+    assert not hasattr(R, "DEPLOY_CONF_LEVELS"), \
+        "the C toggle was removed; its levels should be gone too"
+    src = open(os.path.join(HERE, "rat88_panel.py")).read()
+    assert "cycle_conf" not in src, "cycle_conf is still there"
+
+
+@check("conf: the sequence uses its deploy bar, not the module constant")
+def _():
+    a, _sent, _box = run_auto()
+    a.set_deploy_conf(0.6)
+    a.start()
+    a.step([Det(0.9)])                          # -> PAUSED
+    settle_and_confirm(a, 0.7)                  # 0.7 clears 0.6 but not 0.8
+    assert a.state == "REPOSITIONING", \
+        f"0.7 should deploy at a 0.6 bar, got {a.state}"
+
+    a2, _s2, _b2 = run_auto()
+    a2.set_deploy_conf(0.8)
+    a2.start()
+    a2.step([Det(0.9)])
+    settle_and_confirm(a2, 0.7)
+    assert a2.state == "SCANNING", \
+        f"0.7 should NOT deploy at a 0.8 bar, got {a2.state}"
 
 
 @check("panel: STOP cancels the sequence before sending S")

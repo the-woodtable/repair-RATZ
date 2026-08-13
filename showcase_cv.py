@@ -198,6 +198,17 @@ class CVWorker(threading.Thread):
         self.detections_r = []
         self.infer_ms = 0.0
 
+    def set_conf(self, value: float):
+        """Change the detection threshold while running.
+
+        Sets it on the tracker too, not just here: self.conf is only what the
+        tracker was built with, and YOLO reads conf_threshold on every call.
+        """
+        self.conf = float(value)
+        for tracker in (self.tracker_l, self.tracker_r):
+            if tracker is not None:
+                tracker.conf_threshold = float(value)
+
     def submit(self, left_bgr, right_bgr):
         """Called from the GUI thread. Keeps only the newest frame per
         camera; stale frames are dropped rather than queued, so the worker
@@ -260,6 +271,32 @@ class CVWorker(threading.Thread):
 
 MASK_COLOR = (118, 230, 0)      # BGR, matches the panel's green
 TEXT_COLOR = (255, 255, 255)
+
+
+def draw_conf_badge(frame_bgr, det_conf, deploy_conf):
+    """Print BOTH thresholds in the corner of the frame.
+
+    Both, because they are easy to confuse and they answer different
+    questions. det is why a box is or is not drawn; deploy is why the robot
+    did or did not commit a lining to a crack you can plainly see.
+
+    On the video rather than in the status strip because the strip is hidden
+    during the showcase, and a threshold you cannot see is one you cannot
+    trust: "no cracks here" and "the bar is too high" look identical
+    otherwise.
+
+    Both are fixed at runtime; this is a readout, not a control.
+    """
+    out = frame_bgr
+    h = out.shape[0]
+    txt = f"det {det_conf:.2f}  deploy {deploy_conf:.2f}"
+    (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+    x, y = 6, h - 8
+    bg, fg = (0, 0, 0), (235, 235, 235)
+    cv2.rectangle(out, (x - 4, y - th - 6), (x + tw + 4, y + 4), bg, -1)
+    cv2.putText(out, txt, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, fg, 1,
+                cv2.LINE_AA)
+    return out
 
 
 def draw_detections(frame_bgr, detections):

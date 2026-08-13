@@ -63,7 +63,7 @@ import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import (QBuffer, QObject, QPoint, QRect, QSize, Qt,
+from PySide6.QtCore import (QBuffer, QEvent, QObject, QPoint, QRect, QSize, Qt,
                             QTimer, Signal)
 from PySide6.QtGui import (QColor, QFont, QIcon, QImage, QPainter,
                            QPen, QPixmap, QTransform)
@@ -306,8 +306,29 @@ SPOOL = ("Y", "T", "string out", "wound in", False)
 # ---------------------------------------------------------------------------
 SPEED_LEVELS = [25, 50, 75, 100, 125, 150, 175, 200, 250, 300]   # steps/sec
 SPEED_CMDS = "abcdefghij"
-SPEED_BOOT_INDEX = 3        # 100 Hz, which is main.cpp's STEP_HZ
+SPEED_BOOT_INDEX = 1        # 50 Hz, which is main.cpp's STEP_HZ
 SPEED_FIELD = "step_hz"     # telemetry echo, so the panel can confirm
+
+# C cycles the crack-detection threshold between these. Panel-side only -
+# nothing is sent to the robot; it changes what YOLO reports at all.
+# ---------------------------------------------------------------------------
+# THE THREE CONFIDENCE THRESHOLDS. They are easy to confuse, so:
+#
+#   1. DETECTION, 0.4   (--conf, showcase_cv.CVWorker)
+#      What YOLO bothers to report at all, and therefore what gets drawn on
+#      the video. Lower it and you see more, including more rubbish. C does
+#      NOT touch this.
+#
+#   2. PAUSE TRIGGER, 0.5   (auto_sequence.AUTO_PAUSE_TRIGGER_CONF)
+#      Enough to make the robot stop and take a proper look.
+#
+#   3. DEPLOY, 0.6   (auto_sequence.AUTO_DEPLOY_CONF)
+#      Averaged over AUTO_PAUSE_CONFIRM_TICKS, the bar for actually committing
+#      a lining. THIS is what C toggles, because it is the decision with a
+#      physical consequence.
+# ---------------------------------------------------------------------------
+# The deploy bar is fixed. Change it in ONE place - AUTO_DEPLOY_CONF in
+# auto_sequence.py - and the panel follows.
 
 ODO_CMD_ZERO = "Z"
 ODO_FIELD = "pos_mm"
@@ -762,6 +783,38 @@ def scv_conf_min():
 
 def scv_conf_max():
     return auto.SCREENSHOT_CONF_MAX if HAVE_AUTO else "?"
+
+
+class KeyRouter(QObject):
+    """Sends every keystroke to the panel, whatever has focus.
+
+    keyPressEvent on a QWidget only fires when THAT widget has focus. The
+    buttons are all NoFocus so the panel should keep it, but focus still moves
+    away in practice — after the gallery dialog opens and closes, after a
+    fullscreen transition, or after any click that Qt decides was a focus
+    change. When that happens the panel goes deaf and the shortcuts appear to
+    stop working, with no error anywhere.
+
+    Filtering on the application instead means the keys work no matter what
+    Qt thinks is focused. Keys are only claimed while the panel's own window
+    is the active one, so typing in the gallery still behaves normally.
+    """
+
+    def __init__(self, panel):
+        super().__init__(panel)
+        self.panel = panel
+
+    def eventFilter(self, obj, event):
+        et = event.type()
+        if et not in (QEvent.KeyPress, QEvent.KeyRelease):
+            return False
+        if self.panel.window() is not QApplication.activeWindow():
+            return False                      # a dialog is in front; leave it
+        if et == QEvent.KeyPress:
+            self.panel.keyPressEvent(event)
+        else:
+            self.panel.keyReleaseEvent(event)
+        return True                           # handled; do not double-deliver
 
 
 class Toggle:
@@ -1249,6 +1302,8 @@ class Panel(QWidget):
         self.cv = None
         self.cv_note = CV_IMPORT_ERROR or ""
         if self._use_cv:
+            # The DETECTION threshold, from --conf. Unrelated to the deploy
+            # bar that C moves.
             self.cv = scv.CVWorker(conf=self._conf)
             self.cv.start()
             if self.cv.cv_error:
@@ -1671,6 +1726,17 @@ class Panel(QWidget):
         self.speed_index = i
         self.send(SPEED_CMDS[i])
 
+    @property
+    def deploy_conf(self) -> float:
+        """The bar for committing a lining. Read from the sequence rather than
+        kept here, so there is only one copy of it to be wrong."""
+        return self.auto.deploy_conf if self.auto else auto.AUTO_DEPLOY_CONF
+
+    @property
+    def det_conf(self) -> float:
+        """What YOLO reports at all. Fixed by --conf; C does not touch it."""
+        return self.cv.conf if self.cv else self._conf
+
     def speed_hz(self) -> int:
         """What the robot is actually running at if it has told us, otherwise
         what we last asked for."""
@@ -1810,6 +1876,11 @@ class Panel(QWidget):
                 else:
                     self._det_count_r = 0
 
+            # Always, detections or not - the threshold matters MOST when
+            # nothing is being found, because "no cracks here" and "the bar is
+            # set too high" look identical on screen otherwise.
+            bgr = scv.draw_conf_badge(bgr, self.det_conf, self.deploy_conf)
+
         pane.show_frame(bgr_to_qimage(bgr))
 
     def on_telemetry(self, line: str):
@@ -1884,7 +1955,8 @@ class Panel(QWidget):
             f"{self.auto_status}   "
             f"{cv_txt}   {tel}     "
             f"[{'/'.join(HOOK_LABEL)}]=hook  [D/R]=lining  [T/Y]=spool  "
-            "[L]=lamp  [0-9]=bright  [-/=]=speed  [space]=stop  [esc]=quit")
+            f"det={self.det_conf:.2f} deploy={self.deploy_conf:.2f}   "
+            "[L]=lamp [0-9]=bright [-/=]=speed [space]=stop [esc]=quit")
 
     def closeEvent(self, e):
         """Runs whether or not the status strip is shown. Without it the drive
@@ -1968,6 +2040,12 @@ def main():
     panel.raise_()
     panel.activateWindow()
     panel.setFocus()
+
+    # Route keys through the application, so shortcuts keep working even after
+    # focus wanders to a child widget or a dialog.
+    panel.key_router = KeyRouter(panel)
+    app.installEventFilter(panel.key_router)
+
     return app.exec()
 
 

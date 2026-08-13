@@ -110,11 +110,17 @@ POST_DEPLOY_WAIT_SECS = 5.0
 # mode flag -- 0 idle, +1 extending, -1 retracting -- that goes still the
 # INSTANT motion starts, not when it finishes; there's no position feedback
 # or limit switch. So completion can't be detected, only timed. Measured
-# both deploy and retract at exactly 10s (stopwatch, current ACT_SPEED) --
-# this adds a 3s margin so a slightly slower run still finishes. Re-measure
-# and adjust if ACT_SPEED changes, or split into two constants if deploy and
-# retract ever need different durations.
-ACTUATOR_RUN_SECS = 13.0
+# both deploy and retract at exactly 10s (stopwatch, current ACT_SPEED).
+#
+# This MUST NOT exceed Actuator::MAX_RUN_MS (10000ms in Actuator.h) -- that
+# cutoff is what actually stops the motor, so a longer wait here does not run
+# the actuator for longer, it just leaves the sequence believing it is still
+# deploying after the motor has already stopped. It used to be 13.0 for "3s of
+# margin", which the firmware never allowed to happen.
+#
+# Re-measure and adjust if ACT_SPEED changes, or split into two constants if
+# deploy and retract ever need different durations.
+ACTUATOR_RUN_SECS = 10.0
 # How close to "home" (position 0, i.e. wherever ZERO ODOM was last pressed)
 # counts as arrived, when driving back via the RETURN HOME button, in mm.
 HOME_TOLERANCE_MM = 2.0
