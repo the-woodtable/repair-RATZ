@@ -42,11 +42,8 @@ except ImportError:
 AUTO_PAUSE_TRIGGER_CONF = 0.5
 # ...and this much, averaged, to actually commit to deploying a lining. Much
 # higher on purpose: a false positive here wastes travel and operator time.
-<<<<<<< HEAD
-AUTO_DEPLOY_CONF = 0.75
-=======
 AUTO_DEPLOY_CONF = 0.70
->>>>>>> 43fcc4ac73beb8d7952a07c4b92d28a7b16d99f4
+
 # How far to drive PAST a confirmed crack before deploying, in mm.
 AUTO_REPOSITION_MM = 30.0
 PRE_DEPLOY_WAIT_SECS = 5.0
