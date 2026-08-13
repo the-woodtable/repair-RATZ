@@ -45,7 +45,7 @@ IMU imu;
 LED led;
 
 //STEPPER VARIABLES
-int STEP_HZ = 100;
+int STEP_HZ = 50;
 
 // Ten selectable drive speeds, picked from the panel with the characters
 // 'a'..'j' ('a' = slowest). Lower case on purpose: every other command is

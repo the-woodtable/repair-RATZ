@@ -42,7 +42,7 @@ except ImportError:
 AUTO_PAUSE_TRIGGER_CONF = 0.5
 # ...and this much, averaged, to actually commit to deploying a lining. Much
 # higher on purpose: a false positive here wastes travel and operator time.
-AUTO_DEPLOY_CONF = 0.8
+AUTO_DEPLOY_CONF = 0.60
 # How far to drive PAST a confirmed crack before deploying, in mm.
 AUTO_REPOSITION_MM = 30.0
 PRE_DEPLOY_WAIT_SECS = 5.0
@@ -58,7 +58,7 @@ HOME_TOLERANCE_MM = 2.0
 AUTO_PAUSE_SETTLE_TICKS = 5
 # Then average over this many ticks. A single frame can spike or drop from
 # lighting flicker or a partial view.
-AUTO_PAUSE_CONFIRM_TICKS = 8
+AUTO_PAUSE_CONFIRM_TICKS = 15
 
 # Ambiguous cracks - confident enough to be worth a human look, not confident
 # enough to act on - get one screenshot each.
